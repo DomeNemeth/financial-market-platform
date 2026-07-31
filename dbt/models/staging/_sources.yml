@@ -1,0 +1,18 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    description: "Raw data as landed from source APIs. Written by ingestion adapters."
+    tables:
+      - name: prices
+        description: "Raw OHLCV price data from all sources. Grain: one row per (ticker, trading_date, source)."
+        columns:
+          - name: ticker
+            description: "Stock ticker symbol (e.g. AAPL)"
+          - name: trading_date
+            description: "The trading date in exchange-local timezone (UTC date for Polygon daily bars)"
+          - name: source
+            description: "Data vendor: polygon | yahoo | alpha_vantage"
+          - name: close
+            description: "Unadjusted closing price"

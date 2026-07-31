@@ -1,0 +1,27 @@
+version: 2
+
+models:
+  - name: stg_polygon__prices
+    description: >
+      Staged OHLCV daily bars from Polygon.io.
+      Grain: one row per (ticker, trading_date).
+      Source: raw.prices where source = 'polygon'.
+      Type-coerced and sanity-filtered but otherwise unmodified from raw.
+    columns:
+      - name: ticker
+        description: "Stock ticker symbol"
+        tests:
+          - not_null
+      - name: trading_date
+        description: "Trading date (UTC date per Polygon bar timestamp)"
+        tests:
+          - not_null
+      - name: close_price
+        description: "Unadjusted closing price"
+        tests:
+          - not_null
+      - name: source
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['polygon']
