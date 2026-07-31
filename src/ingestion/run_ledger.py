@@ -34,7 +34,7 @@ class RunLedger:
         result = self._conn.execute(
             text("""
                 INSERT INTO public.pipeline_runs (flow_name, status, started_at, metadata)
-                VALUES (:flow_name, 'RUNNING', :started_at, :metadata::jsonb)
+                VALUES (:flow_name, 'RUNNING', :started_at, CAST(:metadata AS jsonb))
                 RETURNING id
             """),
             {

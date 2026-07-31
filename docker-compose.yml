@@ -11,7 +11,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
-      - "5432:5432"
+      # Published on 5433 because a native Windows PostgreSQL 18 service
+      # (postgresql-x64-18) already owns host port 5432. Container-internal
+      # port stays 5432 — only the host-side mapping changes.
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgres:/docker-entrypoint-initdb.d:ro
@@ -31,6 +34,10 @@ services:
       # Override POSTGRES_HOST for container networking.
       # Inside Docker, containers reach each other by service name, not localhost.
       POSTGRES_HOST: postgres
+      # Override POSTGRES_PORT for the same reason: .env carries the host-side
+      # port (5433) for pytest/dbt, but inside the Docker network Postgres is
+      # still listening on its native 5432.
+      POSTGRES_PORT: 5432
     ports:
       - "8000:8000"
     volumes:
