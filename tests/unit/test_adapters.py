@@ -95,6 +95,30 @@ class TestPolygonAdapterValidate:
         assert result["close"].dtype == float
         assert result["open"].dtype == float
 
+    def test_fractional_volume_survives_validation(self):
+        """
+        Regression: Polygon reports fractional volume (fractional-share trades
+        aggregated), e.g. v=56090840.685498. validate() used to cast volume to
+        Int64, which raises TypeError on a non-integral value and killed the
+        first real ingestion run. Volume stays floating point through the raw
+        layer; dbt staging rounds it to a whole share count.
+        """
+        adapter = make_adapter()
+        df = pd.DataFrame({
+            "ticker": ["AAPL"],
+            "trading_date": ["2026-07-29"],
+            "open": [339.73],
+            "high": [344.5699],
+            "low": [337.3501],
+            "close": [338.19],
+            "volume": [56090840.685498],
+            "source": ["polygon"],
+        })
+
+        result = adapter.validate(df)
+
+        assert result["volume"].iloc[0] == pytest.approx(56090840.685498)
+
     def test_empty_dataframe_passes_validation(self):
         """validate() should return empty DF, not raise, when input is empty."""
         adapter = make_adapter()

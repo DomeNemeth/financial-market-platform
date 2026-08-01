@@ -17,6 +17,7 @@ dependencies = [
     "psycopg2-binary>=2.9",
     "dbt-postgres>=1.7",
     "requests>=2.31",
+    "truststore>=0.10",
     "tenacity>=8.0",
     "pyarrow>=16.0",
     "pandas>=2.0",

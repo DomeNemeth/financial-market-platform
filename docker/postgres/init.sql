@@ -48,7 +48,10 @@ CREATE TABLE IF NOT EXISTS raw.prices (
     high            NUMERIC(18, 6),
     low             NUMERIC(18, 6),
     close           NUMERIC(18, 6),
-    volume          BIGINT,
+    -- NUMERIC, not BIGINT: vendors report fractional volume (Polygon aggregates
+    -- fractional-share trades, e.g. 56090840.685498). The raw layer stores what
+    -- the source sent; rounding to a whole share count happens in dbt staging.
+    volume          NUMERIC(20, 6),
     vwap            NUMERIC(18, 6),
     trade_count     INTEGER,
     source          VARCHAR(50)  NOT NULL,

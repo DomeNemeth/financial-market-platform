@@ -43,8 +43,12 @@ class PolygonAdapter(BaseAdapter):
 
     def __init__(self) -> None:
         self.session = requests.Session()
-        # API key is sent as a query param on every request
-        self.session.params.update({"apiKey": settings.polygon_api_key})
+        # Authenticate via header, NOT the ?apiKey= query param. requests embeds the
+        # full URL in its exception messages, and those get logged and persisted to
+        # pipeline_runs.error_message — a query-param key leaks into both.
+        self.session.headers.update(
+            {"Authorization": f"Bearer {settings.polygon_api_key}"}
+        )
 
     @retry(
         stop=stop_after_attempt(3),
@@ -128,11 +132,13 @@ class PolygonAdapter(BaseAdapter):
 
         # Ensure correct types — never trust API dtypes
         df["trading_date"] = pd.to_datetime(df["trading_date"]).dt.date
-        for col in ["open", "high", "low", "close", "vwap"]:
+        # volume stays floating point on purpose: Polygon reports fractional
+        # volume (fractional-share trades aggregated), so casting to an integer
+        # here would discard source detail in the raw layer. dbt staging rounds
+        # it to a whole share count.
+        for col in ["open", "high", "low", "close", "vwap", "volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        if "volume" in df.columns:
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
         if "trade_count" in df.columns:
             df["trade_count"] = pd.to_numeric(df["trade_count"], errors="coerce").astype("Int64")
 

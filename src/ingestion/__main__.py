@@ -4,10 +4,13 @@ import time
 from datetime import date
 
 from src.common.logging import configure_logging
+from src.common.tls import enable_system_trust_store
 from src.ingestion.adapters.polygon import PolygonAdapter
 from src.ingestion.run_ledger import RunLedger
 
 configure_logging()
+# Must run before any outbound HTTPS request. See src/common/tls.py.
+enable_system_trust_store()
 logger = logging.getLogger(__name__)
 
 # Default ticker list — 10 well-known S&P 500 names

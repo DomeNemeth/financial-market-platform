@@ -20,7 +20,10 @@ renamed_and_filtered as (
         high        as high_price,
         low         as low_price,
         close       as close_price,
-        volume,
+        -- raw.volume is NUMERIC because Polygon reports fractional volume
+        -- (fractional-share trades). Whole-share rounding belongs here, not in
+        -- the raw layer — see raw.prices DDL in docker/postgres/init.sql.
+        round(volume)::bigint as volume,
         vwap,
         trade_count,
         source,
