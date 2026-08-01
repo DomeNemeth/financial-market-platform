@@ -1,0 +1,39 @@
+version: 2
+
+seeds:
+  - name: trading_calendar
+    description: >
+      Exchange sessions generated from the `exchange_calendars` package by
+      scripts/generate_trading_calendar.py. Committed rather than computed at
+      run time so dbt tests need no Python dependency, and so the calendar a
+      result was validated against is pinned in version control instead of
+      floating with a package upgrade.
+
+      One row per (calendar, session_date). Half days are sessions and are
+      included; the platform only handles daily bars, so session length does
+      not matter here.
+    config:
+      # Explicit types: seed inference reads session_date as text, which makes
+      # every BETWEEN against a DATE column a silent string comparison.
+      column_types:
+        calendar: varchar(10)
+        session_date: date
+        year: integer
+        month: integer
+        day_of_week: integer
+    columns:
+      - name: calendar
+        description: "Exchange MIC, e.g. XNYS"
+        tests:
+          - not_null
+      - name: session_date
+        description: "A date the exchange was open"
+        tests:
+          - not_null
+      - name: day_of_week
+        description: "ISO weekday, 1=Monday. Never 6 or 7 for XNYS."
+        tests:
+          - accepted_values:
+              arguments:
+                values: [1, 2, 3, 4, 5]
+                quote: false

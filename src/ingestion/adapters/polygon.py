@@ -89,7 +89,10 @@ class PolygonAdapter(BaseAdapter):
         results = data.get("results") or []
 
         if not results:
-            logger.info(f"No data returned for {ticker} {start_date}–{end_date} (non-trading day or delisted)")
+            logger.info(
+                f"No data returned for {ticker} {start_date}–{end_date} "
+                "(non-trading day or delisted)"
+            )
             return self._empty_dataframe()
 
         rows = []

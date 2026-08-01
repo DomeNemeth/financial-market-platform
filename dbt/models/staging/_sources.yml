@@ -6,7 +6,9 @@ sources:
     description: "Raw data as landed from source APIs. Written by ingestion adapters."
     tables:
       - name: prices
-        description: "Raw OHLCV price data from all sources. Grain: one row per (ticker, trading_date, source)."
+        description: >
+          Raw OHLCV price data from all sources.
+          Grain: one row per (ticker, trading_date, source).
         columns:
           - name: ticker
             description: "Stock ticker symbol (e.g. AAPL)"
@@ -16,3 +18,95 @@ sources:
             description: "Data vendor: polygon | yahoo | alpha_vantage"
           - name: close
             description: "Unadjusted closing price"
+          - name: volume
+            description: >
+              Share volume. NUMERIC, not integral — Polygon aggregates
+              fractional-share trades. Rounded to whole shares in staging.
+
+      - name: security_identity
+        description: >
+          The durable surrogate key. Maps security_id to the natural key it is
+          anchored on — a FIGI once resolved, a provisional vendor:ticker key
+          until then. See ADR-0007.
+        columns:
+          - name: security_id
+            description: "Durable, meaningless surrogate. Never changes, never reused."
+            tests:
+              - unique
+              - not_null
+          - name: identity_key
+            description: "'figi:<FIGI>' when resolved, 'vendor_ticker:<source>:<ticker>' when provisional"
+            tests:
+              - unique
+              - not_null
+          - name: identity_kind
+            description: "figi | vendor_ticker"
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['figi', 'vendor_ticker']
+
+      - name: security_master
+        description: >
+          CURRENT vendor snapshot of security reference data — one row per
+          (security_id, source). Holds no history by design: the SCD2 snapshot
+          owns the system-time axis. See ADR-0004.
+        columns:
+          - name: security_id
+            description: "FK to raw.security_identity"
+            tests:
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('raw', 'security_identity')
+                    field: security_id
+          - name: ticker
+            description: "Current ticker. An ATTRIBUTE, not an identity — tickers are reused."
+            tests:
+              - not_null
+          - name: figi
+            description: "OpenFIGI composite FIGI. Free and redistributable."
+          - name: cusip
+            description: >
+              Licensed identifier (CUSIP Global Services). NULL in this
+              deployment by design — never derived or generated. See ADR-0007.
+          - name: isin
+            description: "Licensed identifier. NULL by design, as with cusip."
+          - name: list_date
+            description: "VALID-time start: when the security became tradeable. Vendor-supplied."
+          - name: delist_date
+            description: "VALID-time end. NULL means still listed."
+
+      - name: corporate_actions
+        description: >
+          Splits and cash dividends. The sole input to the adjustment factors in
+          ADR-0003. Grain: one row per (security_id, action_type, ex_date, source).
+        columns:
+          - name: security_id
+            description: "FK to raw.security_identity"
+            tests:
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('raw', 'security_identity')
+                    field: security_id
+          - name: action_type
+            description: "split | dividend"
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['split', 'dividend']
+          - name: ex_date
+            description: >
+              The date the price basis changes. The only date the adjustment
+              maths uses — a bar ON the ex-date already trades on the new basis.
+            tests:
+              - not_null
+          - name: split_to
+            description: "Numerator of the split ratio. NVDA 2024-06-10 was to=10, from=1."
+          - name: split_from
+            description: "Denominator of the split ratio."
+          - name: cash_amount
+            description: "Dividend per share, in `currency`."

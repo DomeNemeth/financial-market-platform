@@ -25,7 +25,7 @@ def test_success_path_writes_correct_row(db_engine):
 def test_failure_path_records_error_and_reraises(db_engine):
     """Exception path: exception is recorded AND re-raised (never swallowed)."""
     with pytest.raises(ValueError, match="something went wrong"):
-        with RunLedger(flow_name="test_failure") as ledger:
+        with RunLedger(flow_name="test_failure"):
             raise ValueError("something went wrong")
 
     with db_engine.connect() as conn:

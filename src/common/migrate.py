@@ -69,7 +69,17 @@ def discover() -> list[tuple[str, Path]]:
 
 
 def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """
+    Hash the migration's *content*, normalised for line endings.
+
+    Not read_bytes(): git's autocrlf rewrites LF to CRLF on Windows checkout, so
+    the same committed file hashes differently on Windows and Linux. A database
+    applied from one and later checked against the other would report drift that
+    does not exist. Normalising to LF makes the checksum a property of the SQL
+    rather than of the checkout.
+    """
+    normalised = path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 
 def applied(conn) -> dict[str, str]:
