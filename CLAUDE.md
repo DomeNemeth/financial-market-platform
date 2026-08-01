@@ -2,7 +2,7 @@
 
 Multi-source financial market data ingestion, warehousing, and API. Portfolio project #1 of a 25-project curriculum; the author is a GTM Engineer moving toward Data/AI Engineering. **Portfolio quality is the goal** — favour rigour, honest documentation, and decisions that can be defended in an interview over speed.
 
-Python 3.11 · FastAPI · SQLAlchemy · Postgres 16 · dbt-postgres · Docker Compose · pytest · Polygon.io
+Python 3.11 · FastAPI · SQLAlchemy · Postgres 16 · dbt-postgres 1.11 · Docker Compose · pytest · Polygon.io · OpenFIGI
 
 ---
 
@@ -16,86 +16,131 @@ These are deliberate workarounds, not accidents. Don't "fix" them.
 - `docker-compose.yml` overrides **both** `POSTGRES_HOST` and `POSTGRES_PORT` for the `app` service (`postgres` / `5432`), since containers reach each other by service name.
 - If a host-side client fails auth as `market_user`, it is hitting **PG 18**, not our container.
 
-**Always use the venv.** `python` on PATH is 3.14 and has none of the project's dependencies. Use `.venv\Scripts\python.exe`.
+**Always use the venv.** `python` on PATH is 3.14 and has none of the project's dependencies. Use `.venv\Scripts\python.exe`. The venv itself is **3.11.9** — see ADR-0010 for why that is not negotiable.
 
 **Never call `dbt` directly — use `.\scripts\dbt.ps1`.** dbt's `env_var()` reads real OS environment variables, *not* `.env` files. The wrapper loads `.env` via the dotenv CLI and passes `--project-dir`. `~/.dbt/profiles.yml` is kept verbatim identical to the committed `dbt/profiles.yml.example`.
+*Known papercut:* the wrapper always appends `--project-dir`, which `dbt --version` rejects. Use `.\scripts\dbt.ps1 debug` to check the install.
 
-**`make` is not installed** (Chocolatey needs admin, deferred). The `Makefile` exists but is not usable — `scripts/dbt.ps1` fills part of that gap. Use raw commands.
+**`make` is not installed** (Chocolatey needs admin, deferred). The `Makefile` exists but is not usable. Use raw commands.
 
-**Avast intercepts TLS.** Avast Web/Mail Shield MITMs HTTPS with its own root CA (`CN=Avast Web/Mail Shield Root`). That root is in the Windows trust store, so browsers and pip are fine, but Python's `ssl` verifies against the `certifi` bundle and fails with *"unable to get local issuer certificate"*. `src/common/tls.py` calls `truststore.inject_into_ssl()` to verify against the OS trust store instead. Certificate verification stays **on** — never "fix" this with `verify=False`. Any new entrypoint making outbound HTTPS must call `enable_system_trust_store()`.
+**Avast intercepts TLS.** Avast Web/Mail Shield MITMs HTTPS with its own root CA. That root is in the Windows trust store, so browsers work, but anything verifying against a *bundled* CA set fails.
+
+- **At runtime:** `src/common/tls.py` calls `truststore.inject_into_ssl()`. Any new entrypoint making outbound HTTPS must call `enable_system_trust_store()`. Verification stays **on** — never "fix" this with `verify=False`.
+- **At install time:** pip in a fresh venv fails with `CERTIFICATE_VERIFY_FAILED`. Fixed permanently by exporting the Windows root store to `~/.certs/windows-root-ca.pem` and running `pip config set --user global.cert <that path>`. Already done on this machine; regenerate if the trust store changes. `winget` and `uv` both hang outright and are unusable here — see ADR-0010.
 
 ---
 
 ## Commands
 
 ```powershell
-docker compose up -d                              # start stack (Postgres + API)
-.venv\Scripts\python.exe -m pytest tests/unit -v   # unit tests
-.\scripts\dbt.ps1 debug                           # verify dbt connection
-.\scripts\dbt.ps1 run                             # build models
-.\scripts\dbt.ps1 test                            # run data tests
-curl http://localhost:8000/health                 # -> {"status":"ok","db":"connected"}
+docker compose up -d                                    # start stack (Postgres + API)
+.venv\Scripts\python.exe -m src.common.migrate          # apply pending schema migrations
+.venv\Scripts\python.exe -m src.common.migrate --status # show migration state
+
+.venv\Scripts\python.exe -m pytest tests/unit -q        # 26 unit tests, no network/DB
+.venv\Scripts\python.exe -m pytest tests/integration -q # 10 tests, needs stack + API key
+.venv\Scripts\python.exe -m pytest -m "not integration" # unit only, by marker
+
+.venv\Scripts\python.exe -m ruff check src/ tests/ scripts/
+
+.\scripts\dbt.ps1 debug                                 # verify dbt connection
+.\scripts\dbt.ps1 build                                 # seed + snapshot + run + test (28 nodes)
+
+# ingestion
+.venv\Scripts\python.exe -m src.ingestion --tickers AAPL MSFT --start 2026-06-01 --end 2026-06-30
+.venv\Scripts\python.exe -m src.ingestion.security_master --tickers AAPL NVDA
+.venv\Scripts\python.exe -m src.ingestion.corporate_actions --tickers NVDA --since 2024-01-01
+
+curl http://localhost:8000/health                       # -> {"status":"ok","db":"connected"}
 ```
 
 ---
 
-## Where we are — Phase 1 of 7
+## Where we are — Phase 2 of 7, mostly complete
 
-**Phase 1 is functionally complete.** The 2026-08-01 session ran the first real Polygon ingestion end-to-end (AAPL, 2026-07-29) and every checklist item is now verified against real data rather than fixtures.
+**Phase 1 is complete and its three known issues are resolved.** Phase 2 (reference data) is complete except for two automated tests and the README — see *Not done yet* below.
 
-Phase 1 checklist:
+Everything below was verified against real data and a live database on 2026-08-02, not against fixtures.
 
-| # | Item | Status |
-|---|------|--------|
-| 1 | Schemas exist (`raw`/`staging`/`intermediate`/`marts`) | ✅ |
-| 2 | Health endpoint returns OK | ✅ |
-| 3 | Unit tests pass | ✅ 11/11 |
-| 4 | Ingest one ticker for a known trading day | ✅ AAPL 2026-07-29 |
-| 5 | Parquet file written | ✅ `data/raw/prices/polygon/AAPL/2026-07-29.parquet` |
-| 6 | Row lands in `raw.prices` | ✅ 1 row, matches Parquet exactly |
-| 7 | Run ledger records it | ✅ real SUCCESS + 2 real FAILED runs |
-| 8 | dbt staging view builds + tests pass | ✅ 5/5, **non-vacuously** |
+| Check | Status |
+|---|---|
+| `ruff check src/ tests/ scripts/` | ✅ clean |
+| `pytest tests/unit` | ✅ 26 passed |
+| `pytest tests/integration` | ✅ 10 passed |
+| `dbt build` | ✅ 28 nodes, PASS=28 ERROR=0 |
+| Migrations | ✅ 0001–0004 applied |
+| Price data | ✅ 5 tickers × 43 contiguous sessions (2026-06-01 → 2026-07-31) |
 
-Idempotency is also proven on real data: a second identical run left `raw.prices` at 1 row with the same `id` (updated, not inserted).
+### What Phase 2 added
 
-### Next steps
+**Migration runner** (`migrations/` + `src/common/migrate.py`). `docker/postgres/init.sql` only executes on an *empty* data directory, so it can never reach an existing database — the Phase 1 `volume BIGINT → NUMERIC` change had to be hand-applied. Migrations are numbered, forward-only, and checksummed; a migration edited after being applied fails loudly rather than silently diverging. Checksums normalise line endings so a Windows checkout and a Linux one agree. `init.sql` is now bootstrap-only (extensions + schemas).
 
-1. **Resolve the dbt beta** (see below) before tagging.
-2. Backfill a wider date range / the full default ticker list, so the dbt tests run against volume.
-3. Tag `v0.1`, then Phase 2.
+**Security master** (`raw.security_identity`, `raw.security_master`, `src/ingestion/security_master.py`). `security_id` is a durable surrogate anchored on **FIGI**, not ticker. Securities without a FIGI get a *provisional* `vendor_ticker:` identity that is promoted in place when OpenFIGI resolves — `identity_key` changes, `security_id` does not, so no foreign key is ever invalidated. Verified: NVDA → `BBG000BBJQV0`, AAPL → `BBG000B9XRY4`, with real list dates (AAPL 1980-12-12). CUSIP/ISIN columns exist and are **NULL by design**.
+
+**SCD2 snapshot** (`dbt/snapshots/security_master_snapshot.sql`). `strategy='check'` over the mutable attribute set. Gives the *system-time* axis; valid time lives in `list_date`/`delist_date`. Both are tested.
+
+**Corporate actions** (`raw.corporate_actions`, `src/ingestion/corporate_actions.py`). Splits and cash dividends keyed on `ex_date`. CHECK constraints reject a split with no ratio or a dividend with no amount — both would otherwise vanish silently from the factor product. Real data ingested: NVDA's 2021-07-20 4:1 and 2024-06-10 10:1, plus KLAC's 2026-06-12 10:1.
+
+**Trading calendar** (`src/common/calendar.py`, `dbt/seeds/trading_calendar.csv`, 3,162 sessions). Replaces date arithmetic, which is wrong in ways that don't announce themselves: `ex_date - 1 day` lands on a weekend a fifth of the time, and ADR-0003's dividend factor needs the previous *session*.
+
+**Adjusted prices** (`src/transforms/adjusted_prices.py`). The pure-Python reference implementation ADR-0003 calls for — it did not previously exist despite being claimed. Decimal throughout, never float. Two named series (`split_adjusted_*`, `total_return_adjusted_*`); nothing is called `adjusted_close`.
+
+**Range-based ingestion.** `--start/--end` on the CLI. One API call covers a whole range, which matters on a 5-req/min tier. Every ticker's observed dates are diffed against the exchange calendar and gaps reported.
+
+### Things that earned their keep
+
+- **The missing-trading-day dbt test failed on its first run**, correctly flagging that AAPL had a lone 2026-07-29 bar with all of July absent behind it. Backfilled to close the gap; it now passes over a contiguous dataset. It is demonstrably non-vacuous.
+- **The split reconciliation matches Polygon's own adjusted close to 1e-6 relative** on a real 10:1 split, with explicit guards that the window straddles the split and that the raw series really does contain the ~-90% artefact being corrected.
+- **Idempotency proven on real volume**: re-running the 105-row backfill left `count(*)` and `sum(id)` identical (no new IDs allocated) with `ingested_at` advanced.
+
+### Not done yet — pick up here
+
+1. **Idempotency regression test** (`tests/integration/`). Idempotency is *verified manually* (above) but has no automated test. Should cover: intra-batch duplicates collapsing via `DISTINCT ON`, repeated loads not duplicating rows, and last-write-wins ordering.
+2. **Partial-batch failure test.** The policy is decided, implemented, and documented (ADR-0011), but untested. Should assert `PartialIngestionError` is raised, the ledger records `FAILED`, and successful tickers' rows are still committed.
+3. **`README.md` is still a single line.** The last remaining false-by-omission artifact.
+4. **Tag `v0.2`** once 1–3 are done.
 
 ### Known issues
 
-- **`dbt-core` is `1.12.0b3` — a pre-release.** Cause: `pyproject.toml` pins `dbt-postgres>=1.7`, unbounded. A beta is a portfolio risk. Note the interaction: `_staging.yml` nests `accepted_values` under `arguments:` (current-dbt syntax, added to clear a deprecation warning) — pinning backward to an older stable may require reverting that line.
-- `tests/unit/test_run_ledger.py` genuinely requires a live database, so it is an integration test living in `tests/unit/`. Consider moving to `tests/integration/`.
-- `README.md` is a single line. Needs writing before `v1.0`.
-- **The venv interpreter is Python 3.14.2**, but `pyproject.toml` says `requires-python = ">=3.11"`, `[tool.mypy] python_version = "3.11"`, and this file's header says 3.11. Harmless so far, but pick one and make them agree before `v1.0`.
-- `raw.prices.volume` was migrated `BIGINT → NUMERIC(20,6)` with a live `ALTER TABLE` (the dbt staging view had to be dropped first, then rebuilt by `dbt run`). `init.sql` only executes on a fresh volume, so **an existing database will not pick up init.sql edits** — there is no migration tool yet. Worth adding before the schema grows.
+- `tests/unit/test_run_ledger.py` genuinely requires a live database. It should move to `tests/integration/` — `tests/integration/` now exists, so this is a straight move plus a marker.
+- **No CI.** `.github/workflows/` is an empty directory. CLAUDE.md previously implied CI existed ("CI needs no wrapper"); it does not.
+- The provisional→FIGI merge edge case (two identities resolving to one FIGI) is **detected but not repaired** — see ADR-0004. Deliberate.
+- Polygon's free tier caps aggregates at **2 years**; requests for older bars 403. Reference endpoints (splits, dividends, ticker details) are not capped. This is why the split reconciliation uses KLAC 2026 rather than NVDA 2024.
+- `exchange_calendars` only generates ~1 year forward; the seed is clamped to 2027-08-02 and must be regenerated periodically.
 
 ---
 
 ## Architecture decisions — do not silently revise
 
-Reviewed and scoped across 7 phases before any code was written. Full rationale in `docs/adr/` (ADRs 0001–0009).
+Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003, 0004, 0007, 0008, 0010, 0011 are written.** ADRs **0005** (Prefect), **0006** (source priority), and **0009** (API design) are still template stubs — treat their subject matter as undecided.
 
-- **Postgres is the transform substrate.** Python ingestion writes Parquet as an immutable archive **and** loads the same rows into the `raw` Postgres schema. dbt runs entirely against Postgres. DuckDB is a standalone tool for querying Parquet, deliberately **not** in the critical path.
-- **Per-source staging models** (`stg_polygon__prices`, never a merged `stg_prices`). Cross-source merging happens at the *intermediate* layer.
-- **CUSIP/ISIN are licensed identifiers.** The columns exist in the schema but are populated only via free OpenFIGI lookups. Never fabricate them.
-- **Adjusted-price logic is implemented twice on purpose:** pure Python in `src/transforms/adjusted_prices.py` as a unit-testable reference, and dbt SQL for the actual pipeline. Not via dbt-python models.
-- **Raw prices stay raw.** The Polygon adapter requests `adjusted=false` so adjustment logic remains ours and auditable.
-- **`docker-compose.yml` belongs at repo root**, not in `docker/`. Compose discovers it in the working directory, and `build.context: .` resolves relative to it. `docker/` holds *inputs* to compose (`Dockerfile.api`, `postgres/init.sql`).
+- **Postgres is the transform substrate** (ADR-0001). Python ingestion writes Parquet as an immutable archive **and** loads the same rows into `raw`. dbt runs entirely against Postgres. DuckDB is deliberately **not** in the critical path.
+- **Parquet is written before Postgres** (ADR-0002), so a crash leaves an archived file with no row — recoverable — rather than a row with no provenance.
+- **`security_id`, never ticker, is the join key** (ADR-0004, ADR-0007). Tickers are leased and reused; joining on them splices unrelated companies together silently.
+- **CUSIP/ISIN are licensed.** Columns exist, populated only from licence-free sources. **Never** fabricate them — a checksum-valid fake is worse than NULL.
+- **Two adjusted series, never one** (ADR-0003). `split_adjusted_*` for charting, `total_return_adjusted_*` for returns. Factors are stored rather than adjusted prices, so a new action doesn't rewrite history.
+- **Adjusted-price logic is implemented twice on purpose**: pure Python in `src/transforms/adjusted_prices.py` as a unit-testable reference, dbt SQL for the pipeline. A targeted exception to "transform in dbt", not a pattern.
+- **Per-source staging models** (`stg_polygon__prices`, never a merged `stg_prices`). Cross-source merging happens at the *intermediate* layer (ADR-0008).
+- **Raw stays raw.** Polygon is fetched with `adjusted=false` so adjustment stays ours and auditable.
+- **Collect-and-continue on partial batch failure** (ADR-0011), then fail the run inside the ledger. Committed work survives; no incomplete batch is ever recorded `SUCCESS`.
+- **dbt and Python are pinned to stable ranges** (ADR-0010). Not upgradeable casually — read that ADR first.
+- **`docker-compose.yml` belongs at repo root.** `docker/` holds *inputs* to compose.
 
 ---
 
 ## Conventions
 
-- **Adapters** subclass `BaseAdapter` (`src/ingestion/adapters/base.py`), set `SOURCE_NAME`, and implement `fetch()` and `validate()`. `write_parquet()` and `load_to_postgres()` are shared. `fetch()` raises on HTTP errors but returns an *empty DataFrame* for legitimately empty results (weekends, holidays).
-- **Every pipeline run goes through `RunLedger`** (`src/ingestion/run_ledger.py`), a context manager writing to `public.pipeline_runs`. It never swallows exceptions.
-- **Loads are idempotent** — `INSERT ... ON CONFLICT` on `(ticker, trading_date, source)`. Re-running an ingestion must not duplicate rows.
-- **Timestamps:** Polygon daily bars are midnight UTC of the trading date. Use the UTC date directly; converting to ET shifts the date back a day. There is a regression test for this.
-- **Volume is fractional, not integral.** Polygon returns e.g. `v=56090840.685498` (fractional-share trades aggregated). `raw.prices.volume` is `NUMERIC(20,6)` and the adapter keeps it floating point — rounding in the raw layer would violate *raw stays raw*. `stg_polygon__prices` does `round(volume)::bigint`. There is a regression test for this.
-- **API keys go in headers, never query params.** `requests` embeds the full URL in exception messages, which get logged *and* persisted to `pipeline_runs.error_message` — a `?apiKey=` leaks the credential into the database. The Polygon adapter uses `Authorization: Bearer`.
-- **SQLAlchemy `text()` will not bind a `:param` immediately followed by a colon** — it protects Postgres `::` casts. Use `CAST(:param AS jsonb)`, never `:param::jsonb`. This caused a real bug.
+- **Adapters** subclass `BaseAdapter`, set `SOURCE_NAME`, implement `fetch()` and `validate()`. `fetch()` raises on HTTP errors but returns an *empty DataFrame* for legitimately empty results.
+- **All Postgres writes go through `upsert_dataframe()`** (`src/common/database.py`), so the idempotency guarantee is implemented once. It stages into a session-scoped `TEMP` table with `ON COMMIT DROP` — never a permanent one. Built via `CREATE TEMP TABLE ... AS SELECT <cols> FROM <target> WITH NO DATA`, **not** `LIKE`: `LIKE` copies `NOT NULL` but not defaults, so a `BIGSERIAL` id would arrive as a NOT NULL bigint with no sequence and every insert would fail.
+- **`DISTINCT ON` over the conflict key is required, not defensive.** Postgres raises *"ON CONFLICT DO UPDATE command cannot affect row a second time"* if one statement presents two rows with the same key, and vendors do return intra-batch duplicates.
+- **pandas sentinels must become `None` before psycopg2 sees them.** `pd.NA` raises; `float('nan')` is adapted to a literal Postgres `NaN` that `NUMERIC` silently accepts — a missing `vwap` would land as NaN, not NULL, and poison every aggregate. `to_records()` handles this.
+- **Every pipeline run goes through `RunLedger`**, which never swallows exceptions.
+- **Timestamps:** Polygon daily bars are midnight UTC of the trading date. Use the UTC date directly; converting to ET shifts the date back a day. Regression test exists.
+- **Volume is fractional, not integral.** `raw.prices.volume` is `NUMERIC(20,6)`; `round(volume)::bigint` happens in staging. Regression test exists.
+- **Money is `Decimal`, never float.** Adjustment factors multiply, so float error compounds along the chain.
+- **API keys go in headers, never query params.** `requests` embeds the full URL in exception messages, which get persisted to `pipeline_runs.error_message` — a `?apiKey=` leaks the credential into the database.
+- **SQLAlchemy `text()` will not bind a `:param` immediately followed by a colon.** Use `CAST(:param AS jsonb)`, never `:param::jsonb`. This caused a real bug.
+- **Schema changes go in `migrations/`, never in `init.sql`.** Never edit an applied migration — the checksum will reject it. Add a new one.
 - Parquet path: `data/raw/prices/{source}/{ticker}/{YYYY-MM-DD}.parquet` (gitignored).
 - Commit at task boundaries; the author uses commits as session checkpoints.
 
@@ -103,9 +148,9 @@ Reviewed and scoped across 7 phases before any code was written. Full rationale 
 
 ## Roadmap
 
-1. **Foundation** — Docker, Postgres, run ledger, Polygon adapter → tag `v0.1` ← *here*
-2. Reference data — security master, corporate actions, trading calendar
-3. Transform layer — dbt staging → intermediate → marts, adjusted prices
+1. ✅ **Foundation** — Docker, Postgres, run ledger, Polygon adapter
+2. **Reference data** — security master, corporate actions, trading calendar ← *here, ~90%*
+3. Transform layer — dbt intermediate → marts, adjusted prices in SQL
 4. API layer — FastAPI + point-in-time prices endpoint → tag `v0.5`
 5. Completeness — remaining adapters (Yahoo, Alpha Vantage, FRED), Prefect orchestration
 6. Polish — Streamlit dashboard, CI/CD

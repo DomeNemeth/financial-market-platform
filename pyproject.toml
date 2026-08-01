@@ -62,3 +62,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "integration: needs the Docker stack, network, and a real API key. Deselect with -m 'not integration'.",
+]
