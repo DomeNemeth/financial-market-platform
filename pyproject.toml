@@ -15,7 +15,14 @@ dependencies = [
     "sqlalchemy>=2.0",
     "pydantic-settings>=2.0",
     "psycopg2-binary>=2.9",
-    "dbt-postgres>=1.7",
+    # Both pinned to the 1.11 line on purpose — see ADR-0010.
+    # dbt-postgres declares `dbt-core>=1.8.0rc1`; a pre-release in a specifier
+    # makes pip eligible to install pre-releases of that package, which is how an
+    # unbounded `dbt-postgres>=1.7` silently resolved dbt-core to 1.12.0b3.
+    # 1.12.0 is not the fix: it hard-requires dbt-core-experimental-parser>=2.0.0a4,
+    # itself an alpha. 1.11.x is the newest line whose full tree is stable.
+    "dbt-core>=1.11,<1.12",
+    "dbt-postgres>=1.11,<1.12",
     "requests>=2.31",
     "truststore>=0.10",
     "tenacity>=8.0",
@@ -32,7 +39,13 @@ dev = [
     "pytest-asyncio>=0.23",
     "responses>=0.25",
     "ruff>=0.4",
-    "mypy>=1.9",
+    # <2.0: mypy 2.x requires pathspec>=1.0, dbt-core requires pathspec<0.13.
+    "mypy>=1.9,<2.0",
+    # scripts/dbt.ps1 shells out to dotenv.exe, which only exists with the [cli]
+    # extra. It was previously present by accident, as a transitive dependency of
+    # pydantic-settings — which pulls the library but not the console script's
+    # click dependency. Declared explicitly so the wrapper cannot silently break.
+    "python-dotenv[cli]>=1.0",
 ]
 
 [tool.ruff]

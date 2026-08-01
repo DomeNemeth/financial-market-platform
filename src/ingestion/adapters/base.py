@@ -71,54 +71,114 @@ class BaseAdapter(ABC):
         logger.debug(f"Wrote Parquet: {output_path} ({len(df)} rows)")
         return output_path
 
-    def load_to_postgres(self, df: pd.DataFrame) -> int:
+    @staticmethod
+    def _records(df: pd.DataFrame, columns: list[str]) -> list[dict]:
         """
-        Upsert DataFrame into raw.prices in Postgres.
-        Uses a staging temp table + INSERT ... ON CONFLICT for idempotency.
-        Returns the number of rows affected.
+        Project df onto `columns` and convert to executemany-ready dicts.
 
-        This is what dbt reads — the Postgres raw schema is the working copy,
-        Parquet is the archive.
+        The .astype(object).where(notna) dance is load-bearing: psycopg2 cannot
+        adapt pandas sentinels. pd.NA (from Int64 columns like trade_count)
+        raises outright, and float('nan') is adapted to a literal Postgres NaN —
+        which NUMERIC silently accepts, so a missing vwap would land as NaN
+        instead of NULL. Both must become None before they reach the driver.
+        """
+        projected = df[columns]
+        return projected.astype(object).where(pd.notna(projected), None).to_dict("records")
+
+    def upsert(
+        self,
+        df: pd.DataFrame,
+        *,
+        target: str,
+        columns: list[str],
+        conflict_columns: list[str],
+        update_columns: list[str],
+    ) -> int:
+        """
+        Idempotently upsert a DataFrame into a raw table via a staging temp table.
+
+        Returns the number of rows inserted or updated.
+
+        The staging table is a genuine session-scoped TEMP table with
+        ON COMMIT DROP, not a permanent one. An earlier version wrote to a real
+        `raw.prices_tmp`, which had three problems: two concurrent ingestions
+        clobbered each other's staging rows, a crash mid-load left a stray table
+        sitting in the `raw` schema where dbt introspects sources, and its
+        column types were whatever pandas inferred rather than the target's.
+
+        It is built as `CREATE TEMP TABLE ... AS SELECT <cols> FROM <target>
+        WITH NO DATA` rather than `LIKE <target>`. LIKE would copy every column
+        plus its NOT NULL constraints but *not* its defaults, so the BIGSERIAL
+        `id` would arrive as a NOT NULL bigint with no sequence behind it and
+        every insert would fail. The WITH NO DATA projection yields exactly the
+        columns being written, with the target's exact types and no constraints,
+        defaults, or sequence consumption.
         """
         if df.empty:
             return 0
 
         from src.common.database import engine
 
+        staging = f"_stg_{target.replace('.', '_')}"
+        collist = ", ".join(columns)
+        placeholders = ", ".join(f":{c}" for c in columns)
+        conflict = ", ".join(conflict_columns)
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_columns)
+
         with engine.begin() as conn:
-            # Step 1: Write to a temp table (created fresh each time)
-            df.to_sql(
-                "prices_tmp",
-                conn,
-                schema="raw",
-                if_exists="replace",  # Drop and recreate on every load
-                index=False,
-                method="multi",
-                chunksize=1000,
+            # Step 1: session-private staging table, dropped when this transaction commits
+            conn.execute(text(f"""
+                CREATE TEMP TABLE {staging} ON COMMIT DROP AS
+                SELECT {collist} FROM {target} WITH NO DATA
+            """))
+
+            # Step 2: bulk-insert the batch into staging
+            conn.execute(
+                text(f"INSERT INTO {staging} ({collist}) VALUES ({placeholders})"),
+                self._records(df, columns),
             )
 
-            # Step 2: Upsert from temp into the real table
-            result = conn.execute(text("""
-                INSERT INTO raw.prices (
-                    ticker, trading_date, open, high, low, close,
-                    volume, vwap, trade_count, source, ingested_at
-                )
-                SELECT
-                    ticker, trading_date, open, high, low, close,
-                    volume, vwap, trade_count, source, ingested_at
-                FROM raw.prices_tmp
-                ON CONFLICT (ticker, trading_date, source)
-                DO UPDATE SET
-                    open        = EXCLUDED.open,
-                    high        = EXCLUDED.high,
-                    low         = EXCLUDED.low,
-                    close       = EXCLUDED.close,
-                    volume      = EXCLUDED.volume,
-                    vwap        = EXCLUDED.vwap,
-                    trade_count = EXCLUDED.trade_count,
-                    ingested_at = EXCLUDED.ingested_at
+            # Step 3: single set-based upsert into the real table.
+            # DISTINCT ON is required, not defensive: Postgres raises
+            # "ON CONFLICT DO UPDATE command cannot affect row a second time" if
+            # one statement presents two rows with the same conflict key. Vendors
+            # do return intra-batch duplicates (overlapping paginated ranges, a
+            # restated bar). ctid DESC keeps the physically-last staged row, i.e.
+            # last-write-wins in DataFrame order.
+            result = conn.execute(text(f"""
+                INSERT INTO {target} ({collist})
+                SELECT DISTINCT ON ({conflict}) {collist}
+                FROM {staging}
+                ORDER BY {conflict}, ctid DESC
+                ON CONFLICT ({conflict}) DO UPDATE SET {updates}
             """))
 
             rows_affected = result.rowcount
-            logger.info(f"Upserted {rows_affected} rows into raw.prices (source={df['source'].iloc[0] if len(df) else 'unknown'})")
+            logger.info(f"Upserted {rows_affected} rows into {target}")
             return rows_affected
+
+    #: Columns written to raw.prices, and which of them an upsert refreshes.
+    PRICE_COLUMNS: ClassVar[list[str]] = [
+        "ticker", "trading_date", "open", "high", "low", "close",
+        "volume", "vwap", "trade_count", "source", "ingested_at",
+    ]
+    PRICE_CONFLICT_COLUMNS: ClassVar[list[str]] = ["ticker", "trading_date", "source"]
+
+    def load_to_postgres(self, df: pd.DataFrame) -> int:
+        """
+        Upsert OHLCV rows into raw.prices. Idempotent on
+        (ticker, trading_date, source) — re-running must not duplicate rows.
+
+        This is what dbt reads — the Postgres raw schema is the working copy,
+        Parquet is the archive.
+        """
+        return self.upsert(
+            df,
+            target="raw.prices",
+            columns=self.PRICE_COLUMNS,
+            conflict_columns=self.PRICE_CONFLICT_COLUMNS,
+            # The conflict key itself is never updated — it is what matched.
+            update_columns=[
+                c for c in self.PRICE_COLUMNS if c not in self.PRICE_CONFLICT_COLUMNS
+            ],
+        )
