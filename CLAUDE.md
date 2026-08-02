@@ -43,7 +43,7 @@ docker compose up -d                                    # start stack (Postgres 
 .venv\Scripts\python.exe -m ruff check src/ tests/ scripts/
 
 .\scripts\dbt.ps1 debug                                 # verify dbt connection
-.\scripts\dbt.ps1 build                                 # seed + snapshot + run + test (28 nodes)
+.\scripts\dbt.ps1 build                                 # seed + snapshot + run + test (71 nodes, 1 expected WARN)
 
 # ingestion
 .venv\Scripts\python.exe -m src.ingestion --tickers AAPL MSFT --start 2026-06-01 --end 2026-06-30
@@ -55,9 +55,9 @@ curl http://localhost:8000/health                       # -> {"status":"ok","db"
 
 ---
 
-## Where we are — Phase 2 of 7, complete
+## Where we are — Phase 3 of 7, complete
 
-**Phase 1 is complete and its three known issues are resolved. Phase 2 (reference data) is complete and tagged `v0.2`.** Phase 3 (dbt intermediate → marts, adjusted prices in SQL) is next.
+**Phases 1 and 2 are complete. Phase 3 (dbt intermediate → marts, adjusted prices in SQL) is complete and tagged `v0.3`.** Phase 4 (FastAPI point-in-time prices endpoint) is next; it serves from `marts.fct_security_price_daily`.
 
 Everything below was verified against real data and a live database on 2026-08-02, not against fixtures.
 
@@ -65,11 +65,13 @@ Everything below was verified against real data and a live database on 2026-08-0
 |---|---|
 | `ruff check src/ tests/ scripts/` | ✅ clean |
 | `pytest -m "not integration"` | ✅ 23 passed (no network, no DB) |
-| `pytest tests/integration` | ✅ 27 passed |
-| `dbt build` | ✅ 28 nodes, PASS=28 ERROR=0 (23 data tests) |
+| `pytest tests/integration` | ✅ 48 passed |
+| `dbt build` | ✅ 71 nodes, PASS=70 WARN=1 ERROR=0 (61 data tests) |
 | Migrations | ✅ 0001–0004 applied |
-| Price data | ✅ 5 tickers × 43 contiguous sessions (2026-06-01 → 2026-07-31) |
+| Price data | ✅ 6 tickers × 43 contiguous sessions (2026-06-01 → 2026-07-31) |
 | `/health` | ✅ `{"status":"ok","db":"connected"}` |
+
+The one WARN is `assert_dividend_factors_have_a_reference_close` at 142 rows, and it is **expected** — see "Things that earned their keep" below. A build with zero warnings would mean that test had been silently weakened.
 
 ### What Phase 2 added
 
@@ -96,9 +98,25 @@ Everything below was verified against real data and a live database on 2026-08-0
 - **Idempotency is now a regression test, not just a manual observation** (`tests/integration/test_idempotency.py`). Covers duplicates *across* loads (silent row duplication) and *within* one batch (Postgres `CardinalityViolation` aborting the whole load). The intra-batch case was confirmed non-vacuous by running the same upsert without `DISTINCT ON` and watching Postgres reject it.
 - **Partial-batch failure asserts both halves of ADR-0011**: successful tickers committed *and* the run recorded `FAILED`. Includes a clean-batch test so an implementation that failed every run couldn't pass, and a retry test proving re-running after a fix adds only the missing ticker.
 
-### Next up — Phase 3
+### What Phase 3 added
 
-The transform layer: dbt `intermediate` → `marts`, with the ADR-0003 adjustment maths reimplemented in SQL and reconciled against `src/transforms/adjusted_prices.py`. The split reconciliation test already exists and is waiting to be pointed at the SQL version.
+**Intermediate layer.** `int_prices_with_calendar` (identity resolution + calendar check), `int_corporate_actions__factors` (per-event factors), `int_prices_with_adjustments` (the ADR-0003 maths). All views.
+
+**Identity resolution has a home.** `raw.prices` is keyed on ticker and carries **no `security_id`** — price ingestion predates the security master. The ticker → `security_id` resolution happens in `int_prices_with_calendar`, bounded by the security's **valid-time window** (`list_date`/`delist_date`), never by bare ticker equality. Two tests bracket it: one fails on a bar resolving to *no* security, one on a bar resolving to *several*.
+
+**The cumulative product in SQL.** Postgres has no `PRODUCT()`, so factors are `exp(sum(ln(...)))`, computed as `exp(total_ln − running_ln)` — subtract in log space, exponentiate once. That form makes the latest bar's factor **exactly** 1 (`exp(0::numeric) = 1`), so ADR-0003's "the latest bar equals the raw bar" holds by construction rather than by rounding. Three failure modes measured and documented in the **ADR-0003 addendum** — read it before touching this maths.
+
+**Marts.** `dim_security` (current-state, both time axes under unambiguous names) and `fct_security_price_daily` (raw OHLCV + factors + both adjusted series + `actions_observed_through` as ADR-0003's `as_of`). The fact joins the dimension on `security_id` **and** the valid-time window: `security_id` alone can never fail, because the surrogate is durable and never reused, so an unbounded join attaches reference data from the wrong period and nothing raises.
+
+**Data backfilled to make Phase 3 checkable.** KLAC had the 10:1 split but no price bars, and JPM/MSFT/V had bars but no security master row. Both were ingested. The dataset now has a split, two in-window dividends, and three no-action control securities.
+
+### Things that earned their keep
+
+- **The reconciliation is now three-way**, not two. SQL vs Python over *identical staged bars* (so only the arithmetic can differ), plus each against Polygon. Verified non-vacuous by flipping `f.ex_date <= b.trading_date` to `<` — the classic off-by-one — which failed 8 tests across both legs.
+- **The monotonicity test was verified the same way**: inverting the log subtraction (`running − total` instead of `total − running`) fails it. The step-function test correctly stays green on that mutation, which is exactly why both exist — one catches direction, the other catches drift.
+- **`assert_dividend_factors_have_a_reference_close` is `severity: warn` on purpose.** 142 rows, and that is correct: actions are ingested from 2020 while prices cover weeks, so most historical dividends have no bar behind them, and ADR-0003 skips those. Erroring would fail every build on a condition the ADR already accepted, and the test would be deleted within a week. The count should only shrink as history is backfilled.
+- **The total-return series has no external oracle** — Polygon's adjusted aggregates are split-only. It is pinned instead by a definitional property: on the session before an ex-date, `total_return_adjusted_close` equals `close − dividend`, exactly. Verified at 214.75 → 214.50 (NVDA) and 334.47 → 332.97 (JPM).
+- **JPM's 2026-07-06 ex-date is in the test suite specifically** because its previous session is 2026-07-02 — 2026-07-03 is the observed Independence Day holiday. `ex_date - 1 day` lands on Sunday the 5th, finds no bar, and silently drops the dividend. It is the live instance of the hazard the trading calendar exists for.
 
 ### Known issues
 
@@ -111,13 +129,18 @@ The transform layer: dbt `intermediate` → `marts`, with the ADR-0003 adjustmen
 
 ## Architecture decisions — do not silently revise
 
-Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003, 0004, 0007, 0008, 0010, 0011 are written.** ADRs **0005** (Prefect), **0006** (source priority), and **0009** (API design) are still template stubs — treat their subject matter as undecided.
+Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003 (+ its SQL addendum), 0004, 0007, 0008, 0010, 0011 are written.** ADRs **0005** (Prefect), **0006** (source priority), and **0009** (API design) are still template stubs — treat their subject matter as undecided.
+
+**ADR-0006 is the one that will bite first.** The moment a second vendor lands, two sources will disagree about a price on the same `(security_id, trading_date)` and something has to decide which wins. The intermediate layer is already the place ADR-0008 reserves for that decision, and it is currently empty of it — `int_prices_with_calendar` reads one source and does not merge. Whoever adds the second adapter should write ADR-0006 *before* the merge logic, not after.
 
 - **Postgres is the transform substrate** (ADR-0001). Python ingestion writes Parquet as an immutable archive **and** loads the same rows into `raw`. dbt runs entirely against Postgres. DuckDB is deliberately **not** in the critical path.
 - **Parquet is written before Postgres** (ADR-0002), so a crash leaves an archived file with no row — recoverable — rather than a row with no provenance.
 - **`security_id`, never ticker, is the join key** (ADR-0004, ADR-0007). Tickers are leased and reused; joining on them splices unrelated companies together silently.
 - **CUSIP/ISIN are licensed.** Columns exist, populated only from licence-free sources. **Never** fabricate them — a checksum-valid fake is worse than NULL.
 - **Two adjusted series, never one** (ADR-0003). `split_adjusted_*` for charting, `total_return_adjusted_*` for returns. Factors are stored rather than adjusted prices, so a new action doesn't rewrite history.
+- **Cumulative products are `exp(sum(ln(...)))`, in `numeric`, never `float8`** (ADR-0003 addendum). Every log sum is `coalesce(..., 0)` — without it, a security with *no* corporate actions gets `sum()` over zero rows = NULL and its entire adjusted series becomes NULL. That is the majority case, not an edge case.
+- **A non-positive dividend factor is NULL, never clamped** (ADR-0003 addendum). A dividend at or above the previous close can't enter a log product. NULL confines the damage to the affected bars and `assert_dividend_factors_are_positive` names the cause; a clamped value would be wrong by the size of the dividend and look entirely plausible.
+- **Facts join dimensions on `security_id` AND the valid-time window.** `security_id` alone always "works" — the surrogate is durable and never reused — so it fails silently by attaching reference data from the wrong period. Valid time is `list_date`/`delist_date`; the snapshot's `dbt_valid_from`/`to` is *system* time and answers a different question.
 - **Adjusted-price logic is implemented twice on purpose**: pure Python in `src/transforms/adjusted_prices.py` as a unit-testable reference, dbt SQL for the pipeline. A targeted exception to "transform in dbt", not a pattern.
 - **Per-source staging models** (`stg_polygon__prices`, never a merged `stg_prices`). Cross-source merging happens at the *intermediate* layer (ADR-0008).
 - **Raw stays raw.** Polygon is fetched with `adjusted=false` so adjustment stays ours and auditable.
@@ -151,8 +174,8 @@ Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003, 0004, 0007, 0008, 0010, 
 
 1. ✅ **Foundation** — Docker, Postgres, run ledger, Polygon adapter
 2. ✅ **Reference data** — security master, corporate actions, trading calendar → tagged `v0.2`
-3. Transform layer — dbt intermediate → marts, adjusted prices in SQL ← *next*
-4. API layer — FastAPI + point-in-time prices endpoint → tag `v0.5`
+3. ✅ **Transform layer** — dbt intermediate → marts, adjusted prices in SQL → tagged `v0.3`
+4. API layer — FastAPI + point-in-time prices endpoint → tag `v0.5` ← *next*
 5. Completeness — remaining adapters (Yahoo, Alpha Vantage, FRED), Prefect orchestration
 6. Polish — Streamlit dashboard, CI/CD
 7. Release — docs, ADRs, clean-environment test → tag `v1.0`

@@ -58,6 +58,11 @@ DuckDB's single-writer model rules it out here.
 | `raw.security_master` | (security_id, source) | Current vendor reference snapshot |
 | `raw.corporate_actions` | (security_id, action_type, ex_date, source) | Splits and cash dividends |
 | `public.pipeline_runs` | run | Every run, success or failure |
+| `intermediate.int_prices_with_calendar` | (security_id, trading_date) | Bars resolved to a security_id, checked against the session calendar |
+| `intermediate.int_corporate_actions__factors` | (security_id, ex_date) | Per-event split and dividend factors |
+| `intermediate.int_prices_with_adjustments` | (security_id, trading_date) | The ADR-0003 adjustment maths |
+| `marts.dim_security` | security_id | Current-state dimension, both time axes exposed |
+| `marts.fct_security_price_daily` | (security_id, trading_date) | Raw OHLCV + factors + both adjusted series |
 
 `security_id` — not the ticker — is the join key everywhere. Tickers are *leased*
 by exchanges and get reassigned, so joining on them is silently incorrect.
@@ -196,6 +201,15 @@ unit-testable — and dbt SQL implements it again for the pipeline. Disagreement
 between the two is a real signal. This is a deliberate exception to "transform in
 dbt", not a pattern.
 
+Both implementations are now live, and
+[`tests/integration/test_split_reconciliation.py`](tests/integration/test_split_reconciliation.py)
+reconciles them three ways: SQL against Python over identical staged bars, and
+each against Polygon's own adjusted series as an external oracle. The SQL side
+computes the cumulative product as `exp(sum(ln(...)))`, because Postgres has no
+`PRODUCT()` aggregate — a technique with three failure modes, two of which fail
+silently. They are measured and documented in the
+[addendum to ADR-0003](docs/adr/0003-adjusted-price-methodology.md#addendum-computing-the-factor-products-in-sql).
+
 ---
 
 ## Project layout
@@ -208,7 +222,9 @@ src/
   transforms/        Pure-Python adjusted-price reference implementation
   api/               FastAPI app (health only so far)
 dbt/
-  models/staging/    Per-source staging models
+  models/staging/       Per-source staging models
+  models/intermediate/  Identity resolution, calendar checks, adjustment maths
+  models/marts/         dim_security, fct_security_price_daily
   snapshots/         SCD2 security master history
   seeds/             Committed trading calendar
   tests/             Singular data tests
@@ -230,16 +246,15 @@ immutable; the runner rejects one whose checksum has changed.
 Polygon price ingestion (range-based, idempotent, rate-limit aware) · Parquet
 archive · security master with real OpenFIGI resolution · corporate actions
 (splits and dividends) · SCD2 snapshot · trading calendar · migration runner ·
-run ledger · dbt staging layer with 23 data tests · 50 Python tests · health
-endpoint.
+run ledger · full dbt DAG from staging through intermediate to marts, with both
+adjusted series reconciled against the Python reference and against Polygon ·
+61 dbt data tests · 71 Python tests · health endpoint.
 
 **Not built yet:**
 
 - **No data API.** `/health` is the only endpoint. The point-in-time prices
-  endpoint is Phase 4.
-- **No intermediate or marts layer.** Adjusted prices exist in Python but not yet
-  as dbt SQL — that is Phase 3, and it is what the reconciliation test is
-  waiting to be pointed at.
+  endpoint is Phase 4 — `fct_security_price_daily` is the table it will serve
+  from.
 - **One vendor.** Yahoo, Alpha Vantage, and FRED adapters are Phase 5, which is
   also when the per-source staging convention starts paying for itself.
 - **No orchestration.** Ingestion is CLI-driven; Prefect is Phase 5.
@@ -258,6 +273,16 @@ endpoint.
   repaired** — see [ADR-0004](docs/adr/0004-bitemporal-security-master.md).
 - The Parquet archive's immutability is a convention enforced by a single writer,
   not by filesystem permissions. No archive-to-`raw` reconciliation check exists yet.
+- The total-return series has **no external oracle**. Polygon's adjusted
+  aggregates are split-only, so the dividend leg is checked against the Python
+  reference and against a definitional property (on the session before an
+  ex-date, the total-return close equals close minus the dividend) rather than
+  against a third party.
+- `assert_dividend_factors_have_a_reference_close` warns on 142 rows and is
+  *expected* to. Corporate actions are ingested from 2020 while prices cover
+  weeks, so most historical dividends have no bar behind them; ADR-0003 skips
+  those with no factor applied. The count should only ever shrink as price
+  history is backfilled.
 
 ---
 
@@ -265,7 +290,7 @@ endpoint.
 
 1. ✅ Foundation — Docker, Postgres, run ledger, Polygon adapter
 2. ✅ Reference data — security master, corporate actions, trading calendar
-3. ⬜ Transform layer — dbt intermediate → marts, adjusted prices in SQL
+3. ✅ Transform layer — dbt intermediate → marts, adjusted prices in SQL
 4. ⬜ API layer — point-in-time prices endpoint → `v0.5`
 5. ⬜ Completeness — remaining adapters, Prefect orchestration
 6. ⬜ Polish — Streamlit dashboard, CI/CD

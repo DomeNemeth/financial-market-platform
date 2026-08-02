@@ -1,0 +1,124 @@
+version: 2
+
+models:
+  - name: int_prices_with_calendar
+    description: >
+      Staged Polygon bars resolved to a durable security_id and checked against
+      the XNYS session calendar.
+      Grain: one row per (security_id, trading_date).
+
+      The ticker -> security_id resolution lives here because raw.prices carries
+      no security_id, and it is bounded by the security's VALID-time window
+      (list_date/delist_date) rather than being a bare ticker equality — see
+      ADR-0007 on why a naive ticker join splices unrelated companies together.
+    columns:
+      - name: security_id
+        description: >
+          Durable surrogate resolved from the security master. NULL means the
+          bar's ticker resolved to no security in its valid-time window, which
+          is a defect assert_every_price_bar_resolves_to_a_security fails on.
+      - name: trading_date
+        description: "Trading date (UTC date per Polygon bar timestamp)"
+        tests:
+          - not_null
+      - name: close_price
+        description: "Unadjusted closing price, straight from staging"
+        tests:
+          - not_null
+      - name: is_exchange_session
+        description: >
+          True when trading_date is an XNYS session. A false here is a vendor
+          defect — a bar dated on a day the exchange was shut. Flagged rather
+          than filtered, per ADR-0008.
+        tests:
+          - not_null
+
+  - name: int_corporate_actions__factors
+    description: >
+      Corporate actions reshaped into per-event adjustment factors.
+      Grain: one row per (security_id, ex_date) — splits and dividends sharing an
+      ex-date collapse onto one row, each contributing to its own factor chain.
+
+      Reads raw closes from int_prices_with_calendar to resolve the dividend
+      denominator. This is the specific model order ADR-0003's Consequences
+      section calls for; it is not circular, because nothing here reads an
+      adjusted price.
+    columns:
+      - name: security_id
+        tests:
+          - not_null
+      - name: ex_date
+        description: "The date the price basis changes. The only date the maths uses."
+        tests:
+          - not_null
+      - name: split_ratio
+        description: >
+          split_to / split_from, or 1 when the event is not a split. Guaranteed
+          positive by raw.corporate_actions' CHECK constraint, which is what
+          makes ln() on it total.
+        tests:
+          - not_null
+      - name: reference_session_date
+        description: >
+          The last XNYS session strictly before ex_date — the session whose close
+          normalises a dividend. From the calendar seed, never from date
+          arithmetic: JPM's 2026-07-06 ex-date resolves to 2026-07-02, where
+          ex_date - 1 day would land on a Sunday.
+      - name: dividend_factor
+        description: >
+          1 - amount / reference_close, or 1 when the event is not a dividend or
+          its reference close is unavailable. NULL when the factor would be
+          non-positive (a dividend at or above the previous close) — never
+          clamped. See the ADR-0003 addendum.
+      - name: is_dividend_factor_uncomputable
+        tests:
+          - not_null
+      - name: is_reference_close_missing
+        tests:
+          - not_null
+
+  - name: int_prices_with_adjustments
+    description: >
+      ADR-0003's back-adjustment maths applied to every bar.
+      Grain: one row per (security_id, trading_date).
+
+      Cumulative factors are computed as exp(total_ln - running_ln) over the
+      action list — a product aggregate Postgres does not otherwise have. The
+      subtract-then-exponentiate form makes the most recent bar's factor exactly
+      1 rather than approximately 1. Reconciled against
+      src/transforms/adjusted_prices.py by tests/integration/test_split_reconciliation.py.
+    columns:
+      - name: security_id
+        tests:
+          - not_null
+      - name: trading_date
+        tests:
+          - not_null
+      - name: split_factor
+        description: >
+          Product of every split ratio with ex_date strictly greater than
+          trading_date. 1 when no split follows the bar.
+        tests:
+          - not_null
+      - name: split_adjusted_close
+        description: "close_price / split_factor. The basis for charting and price-level comparison."
+        tests:
+          - not_null
+      - name: split_adjusted_volume
+        description: >
+          volume * split_factor. Deliberately fractional — see ADR-0003 on why
+          this is not rounded to a whole share count.
+        tests:
+          - not_null
+      - name: dividend_factor
+        description: >
+          Product of (1 - amount / close_prev_ex) over every dividend with
+          ex_date strictly after trading_date. NULL — deliberately, and only for
+          the bars affected — when some dividend after this bar had a
+          non-positive factor and so could not enter the product.
+      - name: total_return_adjusted_close
+        description: >
+          close_price / split_factor * dividend_factor. The basis for return and
+          performance calculation, never for charting. NULL wherever
+          dividend_factor is NULL; split_adjusted_close remains valid on those
+          same rows.

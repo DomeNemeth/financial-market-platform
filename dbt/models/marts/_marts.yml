@@ -1,0 +1,125 @@
+version: 2
+
+models:
+  - name: dim_security
+    description: >
+      Current-state security dimension, one row per security_id, taken from the
+      SCD2 snapshot filtered to the current system-time version.
+
+      Exposes both time axes under unambiguous names: valid_from/valid_to is
+      VALID time (when the security was tradeable, vendor-supplied), and
+      known_from/known_to is SYSTEM time (when the platform believed the row).
+      ADR-0004 exists because conflating those two is how a point-in-time claim
+      turns out to be false.
+    columns:
+      - name: security_id
+        description: "Durable surrogate. The only correct join key (ADR-0007)."
+        tests:
+          - unique
+          - not_null
+      - name: ticker
+        description: >
+          Current ticker. An ATTRIBUTE, not the identity — tickers are leased by
+          exchanges and reassigned to unrelated companies.
+        tests:
+          - not_null
+      - name: figi
+        description: "OpenFIGI composite FIGI. Free and redistributable."
+      - name: cusip
+        description: "Licensed. NULL in this deployment by design — never derived (ADR-0007)."
+      - name: isin
+        description: "Licensed. NULL by design, as with cusip."
+      - name: valid_from
+        description: "VALID-time start: when the security became tradeable. NULL means unknown."
+      - name: valid_to
+        description: "VALID-time end. NULL means still listed."
+      - name: known_from
+        description: >
+          SYSTEM-time start: when this platform first believed this version of
+          the row. From the snapshot's dbt_valid_from.
+        tests:
+          - not_null
+      - name: known_to
+        description: >
+          SYSTEM-time end. Always NULL in this model, which is filtered to the
+          current version; carried so the column set matches a point-in-time
+          variant.
+      - name: is_active
+        description: >
+          Vendor's "still trading" flag. NOT the filter for this dimension — a
+          delisted security keeps its row here so historical facts can join.
+
+  - name: fct_security_price_daily
+    description: >
+      Daily price fact, one row per (security_id, trading_date). The table the
+      API serves from.
+
+      Stores raw OHLCV, the cumulative adjustment factors, and the two derived
+      series together. The factors are the stored artefact, per ADR-0003: a new
+      corporate action recomputes factors rather than rewriting history, and
+      actions_observed_through records the observation cutoff they were built
+      from. An adjusted column is a function of the action list as of that
+      timestamp, not a fixed historical fact.
+
+      Joined to dim_security on security_id AND the valid-time window, never on
+      security_id alone — see the model header for why the durable surrogate
+      makes an unbounded join fail silently rather than loudly.
+    columns:
+      - name: security_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_security')
+                field: security_id
+      - name: trading_date
+        tests:
+          - not_null
+      - name: vendor_ticker
+        description: "The ticker on the bar as reported. Differs from current_ticker after a rename."
+        tests:
+          - not_null
+      - name: current_ticker
+        description: "The security's current ticker, from dim_security."
+      - name: close_price
+        description: "Unadjusted close, exactly as landed. Byte-comparable with the Parquet archive."
+        tests:
+          - not_null
+      - name: split_factor
+        description: >
+          Product of every split ratio with ex_date strictly after trading_date.
+          Exactly 1 when no split follows the bar.
+        tests:
+          - not_null
+      - name: dividend_factor
+        description: >
+          Product of (1 - amount / close_prev_ex) over every dividend after the
+          bar. NULL only where a dividend after this bar had a non-positive
+          factor; assert_dividend_factors_are_positive names the cause.
+      - name: split_adjusted_close
+        description: "The basis for charting and price-level comparison. Never for returns."
+        tests:
+          - not_null
+      - name: split_adjusted_volume
+        description: >
+          Adjusted inversely to price so price x volume is preserved.
+          Deliberately fractional (ADR-0003).
+        tests:
+          - not_null
+      - name: total_return_adjusted_close
+        description: >
+          The basis for return and performance calculation. Never for charting.
+          Nothing here is called `adjusted_close`; that ambiguity is the problem
+          ADR-0003 exists to solve.
+      - name: actions_observed_through
+        description: >
+          ADR-0003's `as_of`: the latest ingested_at among the corporate actions
+          these factors were built from. NULL for a security with no actions,
+          which is honest — its factor of 1 rests on no observation.
+      - name: built_at
+        description: "When this table was last materialised. Says how stale it is, not which actions it reflects."
+        tests:
+          - not_null
+      - name: is_exchange_session
+        tests:
+          - not_null

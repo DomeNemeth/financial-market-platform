@@ -137,3 +137,175 @@ same failure ADR-0004 exists to prevent.
 **Single `adjusted_close` with a configurable convention.** Rejected — it moves
 the ambiguity into configuration, where it is even easier to get wrong and much
 harder to see in a query result.
+
+---
+
+# Addendum: computing the factor products in SQL
+
+**Date:** 2026-08-02
+**Status:** Accepted
+**Extends:** the "Decision" section above. Changes none of it.
+
+The decision above defines the factors as *products*. Python has `*`. Postgres
+has no `PRODUCT()` aggregate, and none of the SQL standard's window functions
+produce one. This addendum records how the product is actually computed, because
+the technique has three failure modes that are individually easy to miss and
+collectively capable of producing a silently wrong price series — which is the
+one outcome ADR-0003 exists to prevent.
+
+Written before the SQL, so the guards below are requirements on the models rather
+than a description of whatever they happened to do.
+
+## The technique
+
+A product becomes a sum in log space:
+
+```
+Π xᵢ  =  exp( Σ ln xᵢ )
+```
+
+so `exp(sum(ln(x)))` is a product aggregate, and it composes with `GROUP BY` and
+with window frames exactly as `sum` does.
+
+**Direction.** ADR-0003 needs the product over actions *strictly after* the bar.
+An aggregate naturally accumulates over rows *up to and including* the bar. So
+the model computes the inclusive running sum forward and inverts it:
+
+```
+split_factor(d) = exp( Σ_{all actions} ln r  −  Σ_{ex_date ≤ d} ln r )
+                = Π r  for ex_date > d
+```
+
+**Subtract in log space, exponentiate once.** The equivalent-looking
+`exp(total) / exp(running)` is worse in two ways: it rounds twice instead of
+once, and — the reason it actually matters — it loses an exact identity.
+`exp(0::numeric)` is exactly `1` in Postgres (verified). For the most recent bar
+the two sums are the same value, so their difference is exactly zero and the
+factor is exactly `1`. The division form gives `39.9999999999999999 /
+39.9999999999999999`, which is *probably* 1 but is not 1 by construction. The
+back-adjustment convention above promises that the latest bar equals the raw bar;
+this formulation makes that promise hold by arithmetic rather than by luck.
+
+## Failure mode 1 — `ln` of a non-positive number aborts the run
+
+Measured on this Postgres 16:
+
+```
+ln(0::numeric)   ERROR:  cannot take logarithm of zero
+ln(-2::numeric)  ERROR:  cannot take logarithm of a negative number
+```
+
+Loud, not silent — but it aborts the whole `dbt build` with a message naming no
+security, no date, and no row. The two arguments are not equally exposed:
+
+**Split ratios are structurally safe.** `raw.corporate_actions` already CHECKs
+`split_to > 0 AND split_from > 0`, so `split_to / split_from` cannot be zero or
+negative. That constraint was written to stop a split vanishing from the factor
+product; it turns out to also be what makes `ln` on the ratio total. Deleting it
+would now break the transform layer too.
+
+**Dividend factors are not.** `1 − amount / close_prev_ex` is ≤ 0 exactly when a
+dividend meets or exceeds the previous close. That is rare but real — liquidating
+distributions and large special dividends do it — and no constraint can forbid it,
+because it is a true fact about the world rather than a data error.
+
+**Decision: a non-positive dividend factor is NULL, not clamped, and the
+total-return series is NULL for every bar it would have applied to.**
+
+Clamping to a small positive number, or dropping the row from the product, would
+both let the build finish with a `total_return_adjusted_close` that is wrong by
+roughly the size of the dividend and indistinguishable from a right one. Aborting
+would take out the entire warehouse for one security. NULL is the honest value:
+it is the same answer ADR-0007 gives for CUSIP, it cannot be mistaken for a
+price, and it is confined to the security and the bars actually affected.
+
+Two things make it non-silent: the model carries a running count of
+uncomputable dividends after each bar, and `assert_dividend_factors_are_positive`
+fails the build listing every offending `(security_id, ex_date, amount,
+reference_close)`. The failure is loud, attributable, and does not stop the other
+five securities from building.
+
+Note that `sum()` ignores NULLs. That is precisely why the count exists: without
+it, a NULL factor would drop out of the product and be replaced by an implicit
+1.0 — the silent-wrong-answer path, arrived at by doing nothing.
+
+## Failure mode 2 — the empty product is NULL, not 1
+
+`sum()` over zero rows is NULL, so `exp(sum(ln(x)))` over a security with no
+corporate actions is NULL, and every adjusted price derived from it is NULL.
+
+This is the dangerous one, because it hits the *majority* case. Most securities
+have no action in any given window: of the six loaded here, three (AAPL, MSFT, V)
+have none inside the price window at all. An unguarded implementation produces a
+correct-looking series for the interesting securities and an all-NULL one for the
+boring ones, which is easy to skim past.
+
+Every log sum is therefore `coalesce(..., 0)` — the additive identity, giving
+`exp(0) = 1` exactly. Chosen over `coalesce(exp(...), 1)` so the identity lives
+in log space with the rest of the arithmetic, and so a NULL that arrives from
+somewhere unexpected still surfaces rather than being papered over at the end.
+
+Guarded by the mart test that factors are never NULL.
+
+## Failure mode 3 — the result is close to the product, not equal to it
+
+`exp(sum(ln(x)))` is not exact. Measured, in `numeric`:
+
+| chain | exact | computed | rel. error |
+|---|---|---|---|
+| 10:1 (KLAC 2026) | 10 | 10.0000000000000002 | 2e-17 |
+| 4:1 then 10:1 (NVDA) | 40 | 39.9999999999999999 | 2e-18 |
+| 2:1 × 20 | 1048576 | 1048575.9999999998025063 | 1.9e-16 |
+
+Three consequences:
+
+- **Stay in `numeric`.** `float8` was measured at `10.000000000000002` for the
+  same single factor — an order of magnitude worse, and it discards the exactness
+  of `exp(0)`. This is the same reason the Python reference is `Decimal`
+  throughout; the SQL side must not quietly undo it by casting.
+- **Compare with a tolerance, never with `=`.** The reconciliation against the
+  Python reference uses a relative tolerance of 1e-9: eight orders of magnitude
+  looser than the measured error, so it cannot fail on arithmetic noise, and
+  still tight enough that any real disagreement in *method* — an off-by-one on
+  `> d` vs `>= d`, a missed action, an inverted ratio — moves the result by
+  percent, not by 1e-9, and fails immediately.
+- **Stored factors are rounded to 12 dp.** Cosmetic honesty for the realistic
+  case: a security with one or two splits then stores `10.000000000000` rather
+  than a number that looks like a bug in a query result. It is explicitly *not*
+  a correctness guarantee — the 20-split chain above is wrong at the 10th decimal
+  and rounding to 12 does not repair it. Real securities have single-digit split
+  counts, so this is a presentation choice made with its limit understood, not a
+  fix.
+
+The exactness that *is* guaranteed is the one that matters: the identity path.
+No actions after a bar → empty sum → `coalesce(...,0)` → `exp(0)` = 1, exactly,
+with no rounding anywhere on that path.
+
+## Why not a real product aggregate
+
+`CREATE AGGREGATE product(numeric)` over a `numeric` multiply would be exact,
+with no logs and no failure modes 1–3. Rejected: it is DDL that lives outside
+dbt's model graph, so it must be created by a migration and kept in sync with a
+transform layer that has no reference to it — a dependency dbt cannot see, cannot
+test, and cannot rebuild. A fresh clone would fail with "function product does
+not exist" at `dbt run` rather than at `migrate`, which is a bad place to learn
+about it. The precision cost measured above is 1e-16 relative on a quantity used
+to divide prices carrying 6 decimal places; it is not the binding constraint.
+
+Worth revisiting if the platform ever grows a security with a long enough action
+chain for the error to reach the 6th decimal, which needs roughly 10⁹ actions.
+
+## What this addendum does not change
+
+The definitions in the Decision section remain authoritative. In particular the
+strict `ex_date > d` boundary, the two-named-series rule, the inverse volume
+adjustment, and storing factors rather than adjusted prices are all unchanged —
+this is a note on *how the product is evaluated*, not on what it is.
+
+One consequence of that authority is worth stating because it looks like a bug:
+a split with an `ex_date` after the most recent bar **is** included, so the latest
+bar's factor is not 1 during the window between a split's announcement and its
+ex-date. That follows from "the product of all actions strictly after the bar",
+it matches the Python reference exactly, and the reconciliation test would fail if
+SQL diverged. The "latest bar equals the raw bar" property above therefore holds
+whenever no action is pending, which is the ordinary case, and not otherwise.
