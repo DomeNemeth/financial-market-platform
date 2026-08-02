@@ -37,9 +37,8 @@ docker compose up -d                                    # start stack (Postgres 
 .venv\Scripts\python.exe -m src.common.migrate          # apply pending schema migrations
 .venv\Scripts\python.exe -m src.common.migrate --status # show migration state
 
-.venv\Scripts\python.exe -m pytest tests/unit -q        # 26 unit tests, no network/DB
-.venv\Scripts\python.exe -m pytest tests/integration -q # 10 tests, needs stack + API key
-.venv\Scripts\python.exe -m pytest -m "not integration" # unit only, by marker
+.venv\Scripts\python.exe -m pytest -m "not integration" # 23 unit tests, no network/DB
+.venv\Scripts\python.exe -m pytest tests/integration -q # 27 tests, needs stack + API key
 
 .venv\Scripts\python.exe -m ruff check src/ tests/ scripts/
 
@@ -56,20 +55,21 @@ curl http://localhost:8000/health                       # -> {"status":"ok","db"
 
 ---
 
-## Where we are — Phase 2 of 7, mostly complete
+## Where we are — Phase 2 of 7, complete
 
-**Phase 1 is complete and its three known issues are resolved.** Phase 2 (reference data) is complete except for two automated tests and the README — see *Not done yet* below.
+**Phase 1 is complete and its three known issues are resolved. Phase 2 (reference data) is complete and tagged `v0.2`.** Phase 3 (dbt intermediate → marts, adjusted prices in SQL) is next.
 
 Everything below was verified against real data and a live database on 2026-08-02, not against fixtures.
 
 | Check | Status |
 |---|---|
 | `ruff check src/ tests/ scripts/` | ✅ clean |
-| `pytest tests/unit` | ✅ 26 passed |
-| `pytest tests/integration` | ✅ 10 passed |
-| `dbt build` | ✅ 28 nodes, PASS=28 ERROR=0 |
+| `pytest -m "not integration"` | ✅ 23 passed (no network, no DB) |
+| `pytest tests/integration` | ✅ 27 passed |
+| `dbt build` | ✅ 28 nodes, PASS=28 ERROR=0 (23 data tests) |
 | Migrations | ✅ 0001–0004 applied |
 | Price data | ✅ 5 tickers × 43 contiguous sessions (2026-06-01 → 2026-07-31) |
+| `/health` | ✅ `{"status":"ok","db":"connected"}` |
 
 ### What Phase 2 added
 
@@ -93,16 +93,15 @@ Everything below was verified against real data and a live database on 2026-08-0
 - **The split reconciliation matches Polygon's own adjusted close to 1e-6 relative** on a real 10:1 split, with explicit guards that the window straddles the split and that the raw series really does contain the ~-90% artefact being corrected.
 - **Idempotency proven on real volume**: re-running the 105-row backfill left `count(*)` and `sum(id)` identical (no new IDs allocated) with `ingested_at` advanced.
 
-### Not done yet — pick up here
+- **Idempotency is now a regression test, not just a manual observation** (`tests/integration/test_idempotency.py`). Covers duplicates *across* loads (silent row duplication) and *within* one batch (Postgres `CardinalityViolation` aborting the whole load). The intra-batch case was confirmed non-vacuous by running the same upsert without `DISTINCT ON` and watching Postgres reject it.
+- **Partial-batch failure asserts both halves of ADR-0011**: successful tickers committed *and* the run recorded `FAILED`. Includes a clean-batch test so an implementation that failed every run couldn't pass, and a retry test proving re-running after a fix adds only the missing ticker.
 
-1. **Idempotency regression test** (`tests/integration/`). Idempotency is *verified manually* (above) but has no automated test. Should cover: intra-batch duplicates collapsing via `DISTINCT ON`, repeated loads not duplicating rows, and last-write-wins ordering.
-2. **Partial-batch failure test.** The policy is decided, implemented, and documented (ADR-0011), but untested. Should assert `PartialIngestionError` is raised, the ledger records `FAILED`, and successful tickers' rows are still committed.
-3. **`README.md` is still a single line.** The last remaining false-by-omission artifact.
-4. **Tag `v0.2`** once 1–3 are done.
+### Next up — Phase 3
+
+The transform layer: dbt `intermediate` → `marts`, with the ADR-0003 adjustment maths reimplemented in SQL and reconciled against `src/transforms/adjusted_prices.py`. The split reconciliation test already exists and is waiting to be pointed at the SQL version.
 
 ### Known issues
 
-- `tests/unit/test_run_ledger.py` genuinely requires a live database. It should move to `tests/integration/` — `tests/integration/` now exists, so this is a straight move plus a marker.
 - **No CI.** `.github/workflows/` is an empty directory. CLAUDE.md previously implied CI existed ("CI needs no wrapper"); it does not.
 - The provisional→FIGI merge edge case (two identities resolving to one FIGI) is **detected but not repaired** — see ADR-0004. Deliberate.
 - Polygon's free tier caps aggregates at **2 years**; requests for older bars 403. Reference endpoints (splits, dividends, ticker details) are not capped. This is why the split reconciliation uses KLAC 2026 rather than NVDA 2024.
@@ -141,6 +140,8 @@ Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003, 0004, 0007, 0008, 0010, 
 - **API keys go in headers, never query params.** `requests` embeds the full URL in exception messages, which get persisted to `pipeline_runs.error_message` — a `?apiKey=` leaks the credential into the database.
 - **SQLAlchemy `text()` will not bind a `:param` immediately followed by a colon.** Use `CAST(:param AS jsonb)`, never `:param::jsonb`. This caused a real bug.
 - **Schema changes go in `migrations/`, never in `init.sql`.** Never edit an applied migration — the checksum will reject it. Add a new one.
+- **`tests/unit/` must run with Docker down.** Anything needing a database, network, or API key goes in `tests/integration/` with `pytestmark = pytest.mark.integration`. Synthetic fixtures use a distinct `source` value or a `ZZ`-prefixed ticker and clean up after themselves, so they can never be mistaken for real ingested data.
+- **A test that only ever passes proves little.** Each significant test carries a non-vacuity guard — that the window straddles the event, that the raw artefact is really present, that a clean batch still succeeds.
 - Parquet path: `data/raw/prices/{source}/{ticker}/{YYYY-MM-DD}.parquet` (gitignored).
 - Commit at task boundaries; the author uses commits as session checkpoints.
 
@@ -149,8 +150,8 @@ Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003, 0004, 0007, 0008, 0010, 
 ## Roadmap
 
 1. ✅ **Foundation** — Docker, Postgres, run ledger, Polygon adapter
-2. **Reference data** — security master, corporate actions, trading calendar ← *here, ~90%*
-3. Transform layer — dbt intermediate → marts, adjusted prices in SQL
+2. ✅ **Reference data** — security master, corporate actions, trading calendar → tagged `v0.2`
+3. Transform layer — dbt intermediate → marts, adjusted prices in SQL ← *next*
 4. API layer — FastAPI + point-in-time prices endpoint → tag `v0.5`
 5. Completeness — remaining adapters (Yahoo, Alpha Vantage, FRED), Prefect orchestration
 6. Polish — Streamlit dashboard, CI/CD

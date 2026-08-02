@@ -1,7 +1,17 @@
+"""
+RunLedger behaviour against a real database.
+
+Lived in tests/unit/ until 2026-08-02 despite requiring a live Postgres — every
+test here asserts on rows actually written to public.pipeline_runs, so there was
+nothing unit about it and `pytest tests/unit` failed whenever Docker was down.
+"""
+
 import pytest
 from sqlalchemy import text
 
 from src.ingestion.run_ledger import RunLedger
+
+pytestmark = pytest.mark.integration
 
 
 def test_success_path_writes_correct_row(db_engine):
@@ -40,7 +50,7 @@ def test_failure_path_records_error_and_reraises(db_engine):
 
 def test_same_row_is_updated_not_duplicated(db_engine):
     """
-    The RUNNING row inserted in __enter__ must be the same row 
+    The RUNNING row inserted in __enter__ must be the same row
     updated to SUCCESS in __exit__ — not a second row.
     """
     with RunLedger(flow_name="test_no_duplicate") as ledger:
@@ -48,7 +58,10 @@ def test_same_row_is_updated_not_duplicated(db_engine):
 
     with db_engine.connect() as conn:
         count = conn.execute(
-            text("SELECT COUNT(*) FROM public.pipeline_runs WHERE flow_name = 'test_no_duplicate'")
+            text(
+                "SELECT COUNT(*) FROM public.pipeline_runs "
+                "WHERE flow_name = 'test_no_duplicate'"
+            )
         ).scalar()
 
     assert count == 1, "Should be exactly one row, not two"
