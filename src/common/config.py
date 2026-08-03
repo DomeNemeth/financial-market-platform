@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     polygon_api_key: str
     alpha_vantage_api_key: str = ""
     openfigi_api_key: str = ""
+    # FRED. Free, but not optional the way the two above are: FRED rejects an
+    # unauthenticated request outright rather than serving a reduced response,
+    # so src/ingestion/fred.py fails loudly at startup when this is blank.
+    fred_api_key: str = ""
+
+    # Yahoo needs no key at all — the chart endpoint is unauthenticated, which
+    # is one of the reasons ADR-0006 makes it the fallback and not the primary.
 
     # App
     app_env: str = "development"

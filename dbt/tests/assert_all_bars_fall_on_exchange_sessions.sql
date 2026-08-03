@@ -10,8 +10,16 @@
 -- shifts every date back one day, landing Monday's bar on Sunday. That defect
 -- produces bars on non-sessions and nothing else in the pipeline notices —
 -- raw.prices will store any date it is handed.
+--
+-- Since ADR-0006 this runs over every vendor at once, and the hazard is now
+-- live in BOTH directions rather than hypothetical in one. The two vendors
+-- stamp a daily bar differently — Polygon at midnight UTC, Yahoo at the session
+-- open in exchange-local time — so the same naive conversion is wrong for each
+-- of them in the opposite direction. `source` is reported so a failure names
+-- which adapter's date handling drifted.
 
 select
+    source,
     security_id,
     ticker,
     trading_date

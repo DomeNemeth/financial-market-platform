@@ -25,6 +25,13 @@ class BaseAdapter(ABC):
 
     SOURCE_NAME: ClassVar[str]  # e.g. "polygon" — must be set on each subclass
 
+    #: Seconds the caller should sleep between tickers. Lives on the adapter
+    #: because it is a property of the vendor, not of the CLI: Polygon's free
+    #: tier is a hard 5 requests/minute, Yahoo publishes no limit at all, and a
+    #: single constant in the CLI would either throttle Yahoo pointlessly or
+    #: breach Polygon's terms.
+    RATE_LIMIT_SLEEP: ClassVar[int] = 12
+
     @abstractmethod
     def fetch(self, ticker: str, start_date: date, end_date: date) -> pd.DataFrame:
         """

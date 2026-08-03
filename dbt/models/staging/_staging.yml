@@ -26,3 +26,49 @@ models:
           - accepted_values:
               arguments:
                 values: ['polygon']
+
+  - name: stg_yahoo__prices
+    description: >
+      Staged OHLCV daily bars from Yahoo Finance.
+      Grain: one row per (ticker, trading_date).
+      Source: raw.prices where source = 'yahoo'.
+
+      NOT ON THE SAME PRICE BASIS AS stg_polygon__prices. Yahoo's chart endpoint
+      back-adjusts for splits and offers no flag to disable it, so these bars are
+      split-adjusted as of the moment they were fetched — KLAC's 2026-06-11 close
+      is 241.164 here against Polygon's 2411.64. The de-adjustment onto the raw
+      basis happens in int_prices_on_raw_basis, not here: ADR-0008 confines
+      staging to renames, casts and cheap sanity filters, and raw must stay
+      faithful to the vendor. See ADR-0006.
+
+      The FALLBACK source. Polygon wins wherever it has a bar.
+    columns:
+      - name: ticker
+        description: "Stock ticker symbol"
+        tests:
+          - not_null
+      - name: trading_date
+        description: >
+          Trading date, derived by converting Yahoo's session-open timestamp to
+          the exchange timezone the response declares — NOT from the UTC date.
+          Yahoo stamps a daily bar at 13:30Z under EDT where Polygon stamps it at
+          midnight UTC, so the two adapters need opposite handling.
+        tests:
+          - not_null
+      - name: close_price
+        description: "Closing price, on Yahoo's split-adjusted basis"
+        tests:
+          - not_null
+      - name: vwap
+        description: >
+          Always NULL. Yahoo supplies no volume-weighted average price, and
+          ADR-0006 refuses to fabricate one — (high+low+close)/3 would be
+          plausible enough that nothing downstream could catch it.
+      - name: trade_count
+        description: "Always NULL. Not supplied by Yahoo. See vwap."
+      - name: source
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['yahoo']

@@ -3,14 +3,21 @@ version: 2
 models:
   - name: int_prices_with_calendar
     description: >
-      Staged Polygon bars resolved to a durable security_id and checked against
-      the XNYS session calendar.
-      Grain: one row per (security_id, trading_date).
+      Staged bars from EVERY price vendor, resolved to a durable security_id and
+      checked against the XNYS session calendar.
+      Grain: one row per (security_id, trading_date, SOURCE).
+
+      The source is part of the grain because this model runs BEFORE the merge —
+      nothing here decides which vendor wins. Nothing downstream may join to it
+      on (security_id, trading_date) alone: with two vendors loaded, such a join
+      fans out and silently doubles whatever it aggregates. Consumers wanting one
+      row per security-date read int_prices_merged.
 
       The ticker -> security_id resolution lives here because raw.prices carries
       no security_id, and it is bounded by the security's VALID-time window
       (list_date/delist_date) rather than being a bare ticker equality — see
       ADR-0007 on why a naive ticker join splices unrelated companies together.
+      Since ADR-0006 it is written once for all vendors rather than once each.
     columns:
       - name: security_id
         description: >
@@ -18,13 +25,27 @@ models:
           bar's ticker resolved to no security in its valid-time window, which
           is a defect assert_every_price_bar_resolves_to_a_security fails on.
       - name: trading_date
-        description: "Trading date (UTC date per Polygon bar timestamp)"
+        description: >
+          Trading date. Derived per vendor: the UTC date for Polygon, whose daily
+          bars are stamped midnight UTC, and the exchange-local date for Yahoo,
+          whose bars are stamped at the session open. The two need opposite
+          handling and both are resolved in their adapters.
         tests:
           - not_null
       - name: close_price
-        description: "Unadjusted closing price, straight from staging"
+        description: >
+          Closing price straight from staging, on WHATEVER BASIS THAT VENDOR
+          USES. Polygon's is unadjusted; Yahoo's is split-adjusted. Do not
+          compare them without going through int_prices_on_raw_basis.
         tests:
           - not_null
+      - name: source
+        description: "Which vendor reported this bar. Part of the grain."
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['polygon', 'yahoo']
       - name: is_exchange_session
         description: >
           True when trading_date is an XNYS session. A false here is a vendor
@@ -33,16 +54,192 @@ models:
         tests:
           - not_null
 
+  - name: int_splits__cumulative
+    description: >
+      The cumulative split factor at every bar date, for undoing a VENDOR's
+      back-adjustment.
+      Grain: one row per (security_id, trading_date), over the union of every
+      vendor's bar dates.
+
+      Deliberately a second implementation of the product in
+      int_prices_with_adjustments, NOT shared code. The two answer different
+      questions — this one undoes Yahoo's back-adjustment, that one applies ours
+      — and they agree only if the vendors' split histories agree. Sharing would
+      make that agreement true by construction and untestable;
+      assert_split_factors_agree_between_models checks it instead. See ADR-0006.
+    columns:
+      - name: security_id
+        tests:
+          - not_null
+      - name: trading_date
+        tests:
+          - not_null
+      - name: split_factor
+        description: >
+          Product of every split ratio with ex_date STRICTLY greater than
+          trading_date. 1 when no split follows the bar, which is the majority
+          case — hence the mandatory coalesce inside the log sum.
+        tests:
+          - not_null
+      - name: splits_after_bar
+        description: >
+          How many splits entered the product. 0 means the factor of 1 is real
+          rather than a silently-empty aggregate, which is the distinction the
+          ADR-0003 addendum's failure mode 2 is about.
+        tests:
+          - not_null
+
+  - name: int_prices_on_raw_basis
+    description: >
+      Every vendor's bars restated on the raw, unadjusted price basis.
+      Grain: one row per (security_id, trading_date, source) — unchanged from
+      int_prices_with_calendar. Nothing is chosen or discarded here.
+
+      Exists so the de-adjustment is written once and consumed twice: by
+      int_prices_merged, which picks a winner, and by int_source_conflicts, which
+      reports what the loser said. Polygon passes through untouched (it is
+      already the raw basis); Yahoo's prices are multiplied and its volume
+      divided by the cumulative split factor. See ADR-0006.
+    columns:
+      - name: security_id
+        tests:
+          - not_null
+      - name: trading_date
+        tests:
+          - not_null
+      - name: close_price
+        description: "Closing price on the raw unadjusted basis, whichever vendor supplied it"
+        tests:
+          - not_null
+      - name: deadjustment_factor
+        description: >
+          The factor applied to get here — 1 for Polygon always, and for Yahoo on
+          any date with no later split. A value other than 1 is what makes a
+          comparison against Polygon actually prove something, which is why
+          assert_deadjusted_yahoo_reconciles_to_polygon_raw checks the count of
+          them and fails when it is zero.
+        tests:
+          - not_null
+      - name: vendor_reported_close
+        description: "What the vendor said before any correction. Kept for auditability."
+        tests:
+          - not_null
+
+  - name: int_prices_merged
+    description: >
+      The single price series, chosen from every vendor that reported a bar.
+      Grain: one row per (security_id, trading_date) — the model that RESTORES
+      that grain after int_prices_with_calendar split it by source.
+
+      ADR-0006's priority rule: Polygon primary, Yahoo fallback, no blending. A
+      merged bar is one vendor's bar whole, and says which. Everything downstream
+      of here reads this model, not int_prices_with_calendar.
+    columns:
+      - name: security_id
+        tests:
+          - not_null
+      - name: trading_date
+        tests:
+          - not_null
+      - name: close_price
+        tests:
+          - not_null
+      - name: source
+        description: "Which vendor won this bar. Provenance survives to the mart."
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['polygon', 'yahoo']
+      - name: sources_available
+        description: >
+          How many vendors reported this bar. 1 means no choice was made and no
+          conflict is possible; >1 means the priority rule actually fired.
+        tests:
+          - not_null
+      - name: is_fallback_bar
+        description: "True when a non-primary vendor supplied this bar."
+        tests:
+          - not_null
+      - name: was_de_adjusted
+        description: >
+          True when a basis correction was actually applied to reach this row,
+          rather than the correction being a no-op multiplication by 1.
+        tests:
+          - not_null
+      - name: vwap
+        description: >
+          NULL on every fallback bar — Yahoo supplies none and ADR-0006 refuses
+          to fabricate one. Sparse by design; consumers aggregating it must
+          handle NULLs.
+      - name: trade_count
+        description: "NULL on every fallback bar. See vwap."
+
+  - name: int_source_conflicts
+    description: >
+      Where two vendors covered the same bar and disagreed about it by more than
+      tolerance.
+      Grain: one row per (security_id, trading_date, source pair) in conflict.
+
+      A model rather than only a warn-test, because a test's rows do not survive
+      the build and "did the vendors disagree about AAPL last Tuesday" has to
+      remain answerable. assert_sources_agree_within_tolerance selects from this.
+
+      Compared AFTER de-adjustment, so a conflict means the vendors genuinely
+      disagree about what traded — not that they state the same price on
+      different bases. Tolerances: 1e-6 relative on prices (Yahoo is float32,
+      ~1e-7), 5e-3 on volume (whole-share vs fractional, plus a late tape
+      correction on the most recent bar). See ADR-0006.
+    columns:
+      - name: security_id
+        tests:
+          - not_null
+      - name: trading_date
+        tests:
+          - not_null
+      - name: has_close_conflict
+        description: >
+          A closing-price disagreement above 1e-6. Should be zero — both vendors
+          take the close from the primary exchange and agree to 5.4e-8 here. If
+          it is ever not, ADR-0006 says to split the warn-test and error on this
+          leg.
+        tests:
+          - not_null
+      - name: has_intraday_conflict
+        description: >
+          An open/high/low disagreement above 1e-4. Intraday extremes are not the
+          same quantity across vendors — they depend on which prints are
+          consolidated — so a non-zero count here is expected and benign.
+        tests:
+          - not_null
+      - name: has_volume_conflict
+        description: >
+          A volume disagreement above 1e-2. Consolidated-tape and
+          primary-exchange volume are different quantities by definition;
+          observed maximum here is 4.4e-3.
+        tests:
+          - not_null
+      - name: max_deadjustment_factor
+        description: >
+          The larger of the two sides' basis corrections. A conflict on a row
+          where this is not 1 would implicate the de-adjustment rather than the
+          vendors.
+
   - name: int_corporate_actions__factors
     description: >
       Corporate actions reshaped into per-event adjustment factors.
       Grain: one row per (security_id, ex_date) — splits and dividends sharing an
       ex-date collapse onto one row, each contributing to its own factor chain.
 
-      Reads raw closes from int_prices_with_calendar to resolve the dividend
+      Reads raw closes from int_prices_merged to resolve the dividend
       denominator. This is the specific model order ADR-0003's Consequences
       section calls for; it is not circular, because nothing here reads an
       adjusted price.
+
+      MERGED, not int_prices_with_calendar: that model carries source in its
+      grain, so the reference-close join would fan out and count every dividend
+      once per vendor. This requirement is what forced ADR-0006 to place the
+      merge after identity resolution.
     columns:
       - name: security_id
         tests:

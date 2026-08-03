@@ -50,9 +50,21 @@
 -- Full analysis, measured precision, and the failure modes in the addendum to
 -- docs/adr/0003-adjusted-price-methodology.md.
 
+-- int_prices_MERGED: one row per (security_id, trading_date), whichever vendor
+-- won it under ADR-0006's priority rule, already restated on the raw
+-- unadjusted basis. Reading int_prices_with_calendar here would multiply every
+-- bar by the number of vendors covering it and break the mart's grain.
+--
+-- Note that these bars are the raw basis, NOT Yahoo's split-adjusted one, so
+-- the maths below is unchanged by the arrival of a second source: it still
+-- back-adjusts prints. The de-adjustment upstream and the back-adjustment here
+-- are inverse operations, and a Yahoo bar that has passed through both is
+-- exactly a Polygon bar that has passed through neither — which is what
+-- assert_deadjusted_yahoo_reconciles_to_polygon_raw checks on the dates both
+-- vendors cover.
 with bars as (
 
-    select * from {{ ref('int_prices_with_calendar') }}
+    select * from {{ ref('int_prices_merged') }}
 
 ),
 

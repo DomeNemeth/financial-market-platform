@@ -24,12 +24,18 @@
 -- dependency that has to be resolved in a specific model order." That order is
 -- resolved here and it is not circular:
 --
---     stg_polygon__prices ─→ int_prices_with_calendar ─→ int_corporate_actions__factors
---                                       │                            │
---                                       └────────────────────────────┴─→ int_prices_with_adjustments
+--     stg_{source}__prices ─→ int_prices_with_calendar ─→ int_prices_merged ─→ int_corporate_actions__factors
+--                                                                  │                          │
+--                                                                  └──────────────────────────┴─→ int_prices_with_adjustments
 --
--- The factors model reads RAW closes from the calendar model. It never reads
+-- The factors model reads RAW closes from the merged model. It never reads
 -- adjusted ones, which is what would actually make it circular.
+--
+-- "Raw" survived the arrival of a second vendor: int_prices_merged de-adjusts
+-- Yahoo's split-adjusted bars back onto the unadjusted basis, so the closes
+-- read here are still vendor prints, not adjusted prices. A dividend's
+-- reference close may now come from either vendor — which is correct, and
+-- which is why the merge has to happen before this model rather than after it.
 --
 -- See the addendum to ADR-0003 for why a non-positive dividend factor becomes
 -- NULL here rather than being clamped or dropped.
@@ -40,9 +46,20 @@ with actions as (
 
 ),
 
+-- int_prices_MERGED, not int_prices_with_calendar, and this is load-bearing.
+--
+-- The reference-close join below is on (security_id, trading_date). Since
+-- ADR-0006 added a second vendor, int_prices_with_calendar carries `source` in
+-- its grain and holds up to one row per vendor per date — so that join would
+-- fan out and every dividend would be counted once per vendor, silently
+-- doubling the dividend leg of the factor product. Nothing would raise: the
+-- factors would simply be wrong by a power.
+--
+-- This requirement is what forced the merge to sit AFTER identity resolution
+-- rather than before it. See ADR-0006's DAG.
 prices as (
 
-    select * from {{ ref('int_prices_with_calendar') }}
+    select * from {{ ref('int_prices_merged') }}
 
 ),
 

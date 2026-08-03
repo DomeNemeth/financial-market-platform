@@ -11,15 +11,30 @@
 -- valid-time windows. That is exactly the ticker-reuse case ADR-0007 is about,
 -- except with the reuse recorded wrongly (windows that overlap rather than
 -- abut), and it is the failure the valid-time bound is supposed to prevent.
+--
+-- ------------------------------------------------------------------------
+-- Counts rows in int_prices_with_calendar itself rather than re-deriving the
+-- join against the security master, which is what this test used to do.
+--
+-- Two reasons, both prompted by ADR-0006 unioning the vendors into that model.
+-- First, the re-derivation was Polygon-shaped — it read stg_polygon__prices, so
+-- a fan-out on a Yahoo bar would have gone unreported and every new vendor
+-- would have owed a copy of this test. Second, a re-derivation only ever tests
+-- the copy of the join written here; it passes happily while the real join in
+-- the model does something else. Counting the model's own output tests the join
+-- that actually runs.
+--
+-- `source` belongs in the grouping because it is part of the model's declared
+-- grain. Two vendors reporting the same date is normal, and is precisely what
+-- int_prices_merged exists to resolve — omitting it would make this test fire
+-- on every date both vendors cover.
 
 select
+    p.source,
     p.ticker,
     p.trading_date,
     count(*) as resolved_security_count
-from {{ ref('stg_polygon__prices') }} p
-inner join {{ ref('stg_polygon__security_master') }} sm
-    on  sm.ticker = p.ticker
-    and p.trading_date >= coalesce(sm.valid_from, '-infinity'::date)
-    and p.trading_date <= coalesce(sm.valid_to,   'infinity'::date)
-group by 1, 2
+from {{ ref('int_prices_with_calendar') }} p
+where p.security_id is not null
+group by 1, 2, 3
 having count(*) > 1

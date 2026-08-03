@@ -41,6 +41,9 @@ class PolygonAdapter(BaseAdapter):
 
     SOURCE_NAME = "polygon"
 
+    #: Free tier is 5 requests/minute — a hard limit, not politeness.
+    RATE_LIMIT_SLEEP = 12
+
     def __init__(self) -> None:
         self.session = requests.Session()
         # Authenticate via header, NOT the ?apiKey= query param. requests embeds the

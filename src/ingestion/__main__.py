@@ -1,8 +1,14 @@
 """
-Polygon OHLCV ingestion CLI.
+OHLCV ingestion CLI.
 
     python -m src.ingestion --date 2026-07-29
     python -m src.ingestion --start 2026-06-01 --end 2026-06-30 --tickers AAPL MSFT
+    python -m src.ingestion --source yahoo --start 2026-06-01 --end 2026-07-31
+
+Polygon is the primary source and the default; Yahoo is the fallback. The
+priority rule that decides which of them reaches the mart is applied in dbt, in
+int_prices_merged — NOT here. This CLI lands whatever the chosen vendor said,
+per source, exactly as ADR-0008 requires of the raw layer.
 
 Partial-failure policy: collect and continue, then fail the run.
 See docs/adr/0011-ingestion-failure-policy.md.
@@ -16,7 +22,9 @@ from datetime import date
 from src.common.calendar import missing_sessions, session_count
 from src.common.logging import configure_logging
 from src.common.tls import enable_system_trust_store
+from src.ingestion.adapters.base import BaseAdapter
 from src.ingestion.adapters.polygon import PolygonAdapter
+from src.ingestion.adapters.yahoo import YahooAdapter
 from src.ingestion.run_ledger import RunLedger
 
 configure_logging()
@@ -30,8 +38,12 @@ DEFAULT_TICKERS = [
     "META", "TSLA", "JPM", "JNJ", "V",
 ]
 
-# Polygon free tier: 5 requests per minute = 12 seconds between requests
-RATE_LIMIT_SLEEP = 12
+#: Keyed on the adapter's own SOURCE_NAME, so the CLI's --source values and the
+#: `source` column in raw.prices can never drift apart.
+ADAPTERS: dict[str, type[BaseAdapter]] = {
+    PolygonAdapter.SOURCE_NAME: PolygonAdapter,
+    YahooAdapter.SOURCE_NAME: YahooAdapter,
+}
 
 
 class PartialIngestionError(Exception):
@@ -39,14 +51,14 @@ class PartialIngestionError(Exception):
 
 
 def ingest_ticker(
-    adapter: PolygonAdapter, ticker: str, start: date, end: date
+    adapter: BaseAdapter, ticker: str, start: date, end: date
 ) -> tuple[int, list[date]]:
     """
     Ingest one ticker over [start, end]. Returns (rows_written, missing_sessions).
 
-    One API call covers the whole range — Polygon's aggregates endpoint is
+    One API call covers the whole range — both vendors' endpoints are
     range-based, so a 30-day backfill costs one request, not 30. That matters on
-    a 5-requests-per-minute tier.
+    Polygon's 5-requests-per-minute tier.
     """
     df = adapter.validate(adapter.fetch(ticker, start, end))
 
@@ -66,7 +78,13 @@ def ingest_ticker(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ingest OHLCV data from Polygon.io into raw Parquet + Postgres"
+        description="Ingest OHLCV data from a vendor into raw Parquet + Postgres"
+    )
+    parser.add_argument(
+        "--source",
+        choices=sorted(ADAPTERS),
+        default=PolygonAdapter.SOURCE_NAME,
+        help="Vendor to ingest from. Polygon is primary (ADR-0006); yahoo is the fallback.",
     )
     parser.add_argument(
         "--tickers",
@@ -96,18 +114,19 @@ def main() -> None:
 
     expected = session_count(start, end)
     logger.info(
-        f"Starting ingestion | {start} → {end} ({expected} sessions) "
-        f"| {len(args.tickers)} ticker(s)"
+        f"Starting ingestion | source={args.source} | {start} → {end} "
+        f"({expected} sessions) | {len(args.tickers)} ticker(s)"
     )
 
-    adapter = PolygonAdapter()
+    adapter = ADAPTERS[args.source]()
     failures: dict[str, str] = {}
     all_gaps: dict[str, list[date]] = {}
     total_rows = 0
 
     with RunLedger(
-        flow_name="polygon_ohlcv",
+        flow_name=f"{args.source}_ohlcv",
         metadata={
+            "source": args.source,
             "tickers": args.tickers,
             "start": str(start),
             "end": str(end),
@@ -138,7 +157,7 @@ def main() -> None:
                 logger.error(f"  {ticker}: FAILED — {exc}")
 
             if i < len(args.tickers) - 1:
-                time.sleep(RATE_LIMIT_SLEEP)
+                time.sleep(adapter.RATE_LIMIT_SLEEP)
 
         ledger.record_rows(total_rows)
 
