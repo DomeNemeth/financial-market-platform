@@ -17,9 +17,10 @@ Three concrete examples, all of which this project handles explicitly:
 | **Corporate actions** | NVDA closed at \$1,208.88 on 2024-06-07 and ~\$120 the next session after a 10:1 split | A −90% return that never happened |
 | **Vendors restate** | Today's reference data gets applied to yesterday's prices | Look-ahead bias — the number looks fine and is wrong |
 
-> **Status: Phase 2 of 7.** The ingestion and reference-data layers are complete
-> and tested against live vendor data. **There is no data API yet** — only a
-> health endpoint. See [Honest status](#honest-status) before evaluating this.
+> **Status: Phase 4 of 7.** Ingestion, reference data, the dbt transform layer,
+> and the point-in-time API are complete and tested against live vendor data.
+> Remaining: additional vendors, orchestration, and CI. See
+> [Honest status](#honest-status) before evaluating this.
 
 ---
 
@@ -35,7 +36,7 @@ Three concrete examples, all of which this project handles explicitly:
                                               dbt: staging ──▶ intermediate ──▶ marts
                                                       │
                                                       ▼
-                                              FastAPI  (Phase 4)
+                                              FastAPI  /securities  /prices
 ```
 
 Every batch is written to **Parquet first, Postgres second**. A crash between
@@ -103,6 +104,8 @@ curl http://localhost:8000/health
 > locally-installed Postgres. Change it in `.env` and `docker-compose.yml` if you
 > prefer 5432.
 
+Interactive API docs are at <http://localhost:8000/docs>.
+
 ### Ingest some data
 
 ```bash
@@ -132,14 +135,76 @@ set natively, `dbt` works directly.
 
 ---
 
+## Querying the API
+
+Two endpoints carry the data contract, and both of them make a point.
+
+```bash
+# Which security holds this ticker? Resolved as of a date you control.
+curl 'http://localhost:8000/securities/KLAC'
+
+# The same window, in two different series.
+curl 'http://localhost:8000/prices/KLAC?price_type=raw&start=2026-06-11&end=2026-06-12'
+curl 'http://localhost:8000/prices/KLAC?price_type=split_adjusted&start=2026-06-11&end=2026-06-12'
+```
+
+Those last two straddle KLA's 10-for-1 split on 2026-06-12, and they disagree —
+which is the entire point:
+
+| `trading_date` | `raw` close | `split_adjusted` close |
+|---|---|---|
+| 2026-06-11 | 2411.640000 | 241.1640000000000000 |
+| 2026-06-12 | 254.540000 | 254.5400000000000000 |
+
+The raw series contains a −89.4% overnight move that never happened to anyone's
+wealth. The adjusted one does not. Neither is "wrong" — they answer different
+questions, which is why you have to say which one you want.
+
+**`price_type` is required. There is no `?adjusted=true`.** Omitting it is a 422,
+not a default:
+
+```bash
+curl 'http://localhost:8000/prices/KLAC'
+# {"error":"validation_error","message":"Request validation failed.",
+#  "details":[{"type":"missing","loc":["query","price_type"],"msg":"Field required"}]}
+```
+
+Any default would be the API silently choosing a series on your behalf, and the
+three choices are not interchangeable: `split_adjusted` is for charting and price
+levels, `total_return_adjusted` is for returns, `raw` is what the vendor sent.
+`total_return_adjusted` returns an explicit `null` for open/high/low/vwap,
+because a dividend factor is defined against the previous session's close and has
+no intraday analogue — a null says "this does not exist" where a substituted
+value would assert something false.
+
+**`as_of` decides which security a ticker resolves to**, against the security's
+list/delist window — never a bare ticker match. It defaults to `end`, or to today
+when the window is open-ended, so a historical query about a delisted company
+answers about *that* company rather than whoever later inherited its symbol. A
+ticker that resolves to nothing is a 404; one that resolves to *several* is a
+**409**, because picking one is precisely the splice the platform exists to
+prevent.
+
+Prices cross the wire as **JSON strings, not numbers** — JSON's only numeric type
+is an IEEE-754 double, and these are decimals. Parse them as decimals.
+
+[ADR-0009](docs/adr/0009-api-design.md) covers the full contract, including the
+error envelope and what `as_of` deliberately does *not* do.
+
+`/pipeline/runs` surfaces the run ledger and is deliberately **untyped** — it is
+an operational endpoint whose value is showing whatever the ledger recorded, not
+a shape to build against.
+
+---
+
 ## Testing
 
 ```bash
 PY=.venv/Scripts/python.exe
 
-$PY -m pytest -m "not integration"   # 23 unit tests — no network, no database
-$PY -m pytest tests/integration      # 27 tests — needs the stack + a Polygon key
-./scripts/dbt.ps1 test               # 23 data tests
+$PY -m pytest -m "not integration"   # 37 unit tests — no network, no database
+$PY -m pytest tests/integration      # 79 tests — needs the stack + a Polygon key
+./scripts/dbt.ps1 test               # 61 data tests
 $PY -m ruff check src/ tests/ scripts/
 ```
 
@@ -163,6 +228,16 @@ not evidence of much:
 - **Partial-batch failure asserts both halves of the policy**: successful tickers
   are committed *and* the run is still recorded `FAILED`. Either one alone is the
   wrong behaviour.
+- **The point-in-time API test asserts an outcome, not a status code.** It builds
+  a ticker held by two unrelated companies over disjoint windows and checks that
+  `as_of` returns *different securities* — plus that a date in the gap between
+  the two listings is a 404 rather than a plausible answer. Verified non-vacuous
+  by reverting the resolver to a bare ticker match, which fails 7 of its 13
+  assertions.
+- **The `price_type` contract is checked as a disagreement between responses**,
+  not as a property of one. Serving the same column for two `price_type` values
+  cannot satisfy it. Verified the same way: pointing `split_adjusted` at the raw
+  columns fails 4 integration assertions and 1 unit assertion.
 
 ---
 
@@ -178,12 +253,13 @@ Written up as ADRs, with the alternatives that were rejected and why:
 | [0004](docs/adr/0004-bitemporal-security-master.md) | Bitemporal security master — valid time and system time kept separate |
 | [0007](docs/adr/0007-identifier-strategy.md) | Surrogate key anchored on FIGI; licensed identifiers never fabricated |
 | [0008](docs/adr/0008-dbt-modeling-conventions.md) | Per-source staging models; cross-source merging only at intermediate |
+| [0009](docs/adr/0009-api-design.md) | Required `price_type` enum; `as_of` resolves valid time only; one error envelope |
 | [0010](docs/adr/0010-dependency-and-runtime-pinning.md) | Stable-only dependency ranges and a pinned interpreter |
 | [0011](docs/adr/0011-ingestion-failure-policy.md) | Collect-and-continue on partial failure, then fail the run |
 
-ADRs **0005** (orchestration), **0006** (source priority), and **0009** (API
-design) are still stubs — that subject matter is genuinely undecided, and the
-files are placeholders rather than documentation.
+ADRs **0005** (orchestration) and **0006** (source priority) are still stubs —
+that subject matter is genuinely undecided, and the files are placeholders rather
+than documentation.
 
 Two decisions that are load-bearing enough to summarise here:
 
@@ -220,7 +296,7 @@ src/
   common/            config, database, logging, TLS, trading calendar, migrate
   ingestion/         Polygon adapter, security master, corporate actions, run ledger
   transforms/        Pure-Python adjusted-price reference implementation
-  api/               FastAPI app (health only so far)
+  api/               FastAPI app: resolution, routers, response schemas
 dbt/
   models/staging/       Per-source staging models
   models/intermediate/  Identity resolution, calendar checks, adjustment maths
@@ -248,17 +324,18 @@ archive · security master with real OpenFIGI resolution · corporate actions
 (splits and dividends) · SCD2 snapshot · trading calendar · migration runner ·
 run ledger · full dbt DAG from staging through intermediate to marts, with both
 adjusted series reconciled against the Python reference and against Polygon ·
-61 dbt data tests · 71 Python tests · health endpoint.
+point-in-time API over `dim_security` and `fct_security_price_daily` ·
+61 dbt data tests · 116 Python tests.
 
 **Not built yet:**
 
-- **No data API.** `/health` is the only endpoint. The point-in-time prices
-  endpoint is Phase 4 — `fct_security_price_daily` is the table it will serve
-  from.
 - **One vendor.** Yahoo, Alpha Vantage, and FRED adapters are Phase 5, which is
   also when the per-source staging convention starts paying for itself.
 - **No orchestration.** Ingestion is CLI-driven; Prefect is Phase 5.
 - **No CI.** `.github/workflows/` is empty.
+- **No auth, no rate limiting, no pagination on the API.** `/prices` caps a
+  response at 5,000 bars and *rejects* anything larger rather than truncating it;
+  pagination will replace that cap rather than sit beside it.
 
 **Known limitations:**
 
@@ -273,6 +350,15 @@ adjusted series reconciled against the Python reference and against Polygon ·
   repaired** — see [ADR-0004](docs/adr/0004-bitemporal-security-master.md).
 - The Parquet archive's immutability is a convention enforced by a single writer,
   not by filesystem permissions. No archive-to-`raw` reconciliation check exists yet.
+- **`as_of` rewinds valid time only.** It decides which security held a ticker on
+  a date; it does *not* replay what the platform believed then, and it does not
+  recompute adjustment factors from only the corporate actions known by then. So
+  a response's adjusted prices reflect every action currently in the warehouse.
+  Every price response carries `actions_observed_through` saying exactly which
+  observation cutoff its factors came from, rather than leaving the gap silent.
+  The full bitemporal replay needs an observation filter in the transform layer
+  that does not exist yet — [ADR-0009](docs/adr/0009-api-design.md) explains why
+  doing half of it would be worse than doing none.
 - The total-return series has **no external oracle**. Polygon's adjusted
   aggregates are split-only, so the dividend leg is checked against the Python
   reference and against a definitional property (on the session before an
@@ -291,7 +377,7 @@ adjusted series reconciled against the Python reference and against Polygon ·
 1. ✅ Foundation — Docker, Postgres, run ledger, Polygon adapter
 2. ✅ Reference data — security master, corporate actions, trading calendar
 3. ✅ Transform layer — dbt intermediate → marts, adjusted prices in SQL
-4. ⬜ API layer — point-in-time prices endpoint → `v0.5`
+4. ✅ API layer — point-in-time prices endpoint → `v0.5`
 5. ⬜ Completeness — remaining adapters, Prefect orchestration
 6. ⬜ Polish — Streamlit dashboard, CI/CD
 7. ⬜ Release — docs, clean-environment test → `v1.0`

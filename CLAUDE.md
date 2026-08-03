@@ -37,8 +37,8 @@ docker compose up -d                                    # start stack (Postgres 
 .venv\Scripts\python.exe -m src.common.migrate          # apply pending schema migrations
 .venv\Scripts\python.exe -m src.common.migrate --status # show migration state
 
-.venv\Scripts\python.exe -m pytest -m "not integration" # 23 unit tests, no network/DB
-.venv\Scripts\python.exe -m pytest tests/integration -q # 27 tests, needs stack + API key
+.venv\Scripts\python.exe -m pytest -m "not integration" # 37 unit tests, no network/DB
+.venv\Scripts\python.exe -m pytest tests/integration -q # 79 tests, needs stack + API key
 
 .venv\Scripts\python.exe -m ruff check src/ tests/ scripts/
 
@@ -51,25 +51,33 @@ docker compose up -d                                    # start stack (Postgres 
 .venv\Scripts\python.exe -m src.ingestion.corporate_actions --tickers NVDA --since 2024-01-01
 
 curl http://localhost:8000/health                       # -> {"status":"ok","db":"connected"}
+
+# API — price_type is REQUIRED; omitting it is a 422, never a default
+curl 'http://localhost:8000/securities/KLAC'
+curl 'http://localhost:8000/prices/KLAC?price_type=split_adjusted&start=2026-06-11&end=2026-06-12'
+curl 'http://localhost:8000/prices/JPM?price_type=total_return_adjusted&start=2026-07-02&end=2026-07-06'
+curl 'http://localhost:8000/pipeline/runs?limit=5'
+# interactive docs: http://localhost:8000/docs
 ```
 
 ---
 
-## Where we are — Phase 3 of 7, complete
+## Where we are — Phase 4 of 7, complete
 
-**Phases 1 and 2 are complete. Phase 3 (dbt intermediate → marts, adjusted prices in SQL) is complete and tagged `v0.3`.** Phase 4 (FastAPI point-in-time prices endpoint) is next; it serves from `marts.fct_security_price_daily`.
+**Phases 1–3 are complete (tagged `v0.2`, `v0.3`). Phase 4 (FastAPI point-in-time API) is complete and tagged `v0.5`.** Phase 5 (remaining adapters, Prefect orchestration) is next.
 
-Everything below was verified against real data and a live database on 2026-08-02, not against fixtures.
+Everything below was verified against real data and a live database on 2026-08-03, not against fixtures.
 
 | Check | Status |
 |---|---|
 | `ruff check src/ tests/ scripts/` | ✅ clean |
-| `pytest -m "not integration"` | ✅ 23 passed (no network, no DB) |
-| `pytest tests/integration` | ✅ 48 passed |
+| `pytest -m "not integration"` | ✅ 37 passed (re-run with the DB unreachable — still 37) |
+| `pytest tests/integration` | ✅ 79 passed |
 | `dbt build` | ✅ 71 nodes, PASS=70 WARN=1 ERROR=0 (61 data tests) |
 | Migrations | ✅ 0001–0004 applied |
 | Price data | ✅ 6 tickers × 43 contiguous sessions (2026-06-01 → 2026-07-31) |
 | `/health` | ✅ `{"status":"ok","db":"connected"}` |
+| API spot-checks | ✅ curl against the live container on the KLAC split and JPM ex-date windows |
 
 The one WARN is `assert_dividend_factors_have_a_reference_close` at 142 rows, and it is **expected** — see "Things that earned their keep" below. A build with zero warnings would mean that test had been silently weakened.
 
@@ -118,18 +126,46 @@ The one WARN is `assert_dividend_factors_have_a_reference_close` at 142 rows, an
 - **The total-return series has no external oracle** — Polygon's adjusted aggregates are split-only. It is pinned instead by a definitional property: on the session before an ex-date, `total_return_adjusted_close` equals `close − dividend`, exactly. Verified at 214.75 → 214.50 (NVDA) and 334.47 → 332.97 (JPM).
 - **JPM's 2026-07-06 ex-date is in the test suite specifically** because its previous session is 2026-07-02 — 2026-07-03 is the observed Independence Day holiday. `ex_date - 1 day` lands on Sunday the 5th, finds no bar, and silently drops the dividend. It is the live instance of the hazard the trading calendar exists for.
 
+### What Phase 4 added
+
+**The resolution query has a home in the API** (`src/api/resolution.py`). One function, used by both data endpoints, so there is a single implementation of "which security is this ticker". `where ticker = :ticker` alone would never once raise while being wrong; resolution is bounded by the security's **valid-time** window as of `as_of`. Zero matches is a 404, more than one is a **409** — the runtime mirror of `assert_every_price_bar_resolves_to_a_security` and `assert_price_bars_resolve_to_one_security`.
+
+**`price_type` is a required enum**, not `?adjusted=true`. `raw` | `split_adjusted` | `total_return_adjusted`. The industry-standard boolean is structurally incapable of expressing ADR-0003's two series, and any *default* would be the API guessing which one the caller meant. The column map is asymmetric because the mart is: `total_return_adjusted` serves explicit NULL for open/high/low/vwap (no intraday analogue for a dividend factor), and reuses `split_adjusted_volume` — which is the arithmetically correct volume for a total-return series, since a dividend does not change the share count.
+
+**`as_of` resolves valid time only** and says so out loud. It does not rewind system time and does not rewind the adjustment factors. Every price response therefore carries `actions_observed_through` beside `as_of` — two "as of" concepts in one payload because two genuinely different things are being said. ADR-0009 explains why doing the dimension half of full bitemporal replay without the factor half would be worse than doing neither.
+
+**One error envelope for everything** (`src/api/errors.py`), including FastAPI's own 422s and routing 404s, which are re-wrapped with Pydantic's field detail preserved intact under `details`. A caller needs one parser, not two.
+
+**Sync SQLAlchemy, deliberately** (ADR-0009 §1). `def` endpoints run in FastAPI's threadpool, so psycopg2 never blocks the event loop, and the repository keeps one engine and one idiom rather than two. The ADR states the measurement that would change the decision: pool-checkout queuing, not a preference.
+
+**Money crosses the wire as a JSON string.** Verified, not assumed — `Decimal("123.456789012345678901")` round-trips with all 21 digits. JSON's only numeric type is a double, and emitting one would discard ADR-0003's decimal guarantee at the last hop.
+
+**`/pipeline/runs` is deliberately untyped** (`response_model=None`). Typed where a consumer depends on the shape, untyped where the value is showing whatever the ledger actually recorded — `metadata` is free-form JSONB per flow.
+
+### Things that earned their keep
+
+- **The point-in-time test asserts an outcome, not a status code.** It builds a ZZ-prefixed ticker held by two unrelated securities over disjoint windows, with a gap year between them, and checks that `as_of` returns *different securities*. Reverting the resolver to a bare ticker match fails **7 of its 13 assertions** — including the gap-year 404 and the price splice. The 6 that still pass are its own non-vacuity guards, which is the correct behaviour for guards.
+- **The gap year is the sharpest discriminator in that file.** A broken resolver still returns *something* for a date inside either listing window; only a date belonging to neither company distinguishes "resolved correctly" from "returned whatever sorted first".
+- **The `price_type` contract is a disagreement between two responses**, not a property of one, so it cannot be satisfied by serving the same column twice. Pointing `split_adjusted` at the raw columns fails 4 integration assertions and 1 unit assertion.
+- **The two adjusted series are pinned at an ex-date boundary as a step function** — strictly below before, exactly equal on and after. An inequality-only test passes the classic `<=`/`<` off-by-one; this does not. JPM's 2026-07-06 is used because its previous session is 2026-07-02 (2026-07-03 is the observed holiday), the live instance of the hazard the trading calendar exists for.
+- **`MAX_BARS` is tested by lowering the cap, not by fabricating 5,000 bars.** The warehouse holds 43 sessions, so the guard can never fire on real data — which is exactly why it needed a test. It asserts rejection *and* that no partial data comes back, plus the boundary in both directions.
+- **The unit tests were re-run with the database unreachable** (`POSTGRES_HOST` pointed at a black-hole address) to prove the new API imports do not violate the "tests/unit runs with Docker down" rule. Still 37 passed.
+
 ### Known issues
 
 - **No CI.** `.github/workflows/` is an empty directory. CLAUDE.md previously implied CI existed ("CI needs no wrapper"); it does not.
 - The provisional→FIGI merge edge case (two identities resolving to one FIGI) is **detected but not repaired** — see ADR-0004. Deliberate.
 - Polygon's free tier caps aggregates at **2 years**; requests for older bars 403. Reference endpoints (splits, dividends, ticker details) are not capped. This is why the split reconciliation uses KLAC 2026 rather than NVDA 2024.
 - `exchange_calendars` only generates ~1 year forward; the seed is clamped to 2027-08-02 and must be regenerated periodically.
+- **`as_of` rewinds valid time only.** It picks which security held a ticker; it does *not* replay what the platform believed then, nor recompute factors from only the actions known by then. Adjusted prices in a response always reflect every action currently in the warehouse. Stated in ADR-0009 and surfaced per-response as `actions_observed_through` rather than left silent. The full replay needs an observation filter in `int_corporate_actions__factors`, which does not exist — a Phase 5 candidate, and it would be a *second* parameter (`as_of_known`), never a redefinition of this one.
+- **The API has no auth, no rate limiting, and no pagination.** `/prices` caps at 5,000 bars and rejects over-cap windows rather than truncating them; pagination will replace that cap, not join it.
+- **The point-in-time test writes fixture rows straight into `marts.dim_security` and `marts.fct_security_price_daily`.** Deliberate — those are the tables the API reads. `dbt build` drops them, which is harmless because the fixture recreates and removes them per module.
 
 ---
 
 ## Architecture decisions — do not silently revise
 
-Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003 (+ its SQL addendum), 0004, 0007, 0008, 0010, 0011 are written.** ADRs **0005** (Prefect), **0006** (source priority), and **0009** (API design) are still template stubs — treat their subject matter as undecided.
+Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003 (+ its SQL addendum), 0004, 0007, 0008, 0009, 0010, 0011 are written.** ADRs **0005** (Prefect) and **0006** (source priority) are still template stubs — treat their subject matter as undecided.
 
 **ADR-0006 is the one that will bite first.** The moment a second vendor lands, two sources will disagree about a price on the same `(security_id, trading_date)` and something has to decide which wins. The intermediate layer is already the place ADR-0008 reserves for that decision, and it is currently empty of it — `int_prices_with_calendar` reads one source and does not merge. Whoever adds the second adapter should write ADR-0006 *before* the merge logic, not after.
 
@@ -145,6 +181,10 @@ Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003 (+ its SQL addendum), 000
 - **Per-source staging models** (`stg_polygon__prices`, never a merged `stg_prices`). Cross-source merging happens at the *intermediate* layer (ADR-0008).
 - **Raw stays raw.** Polygon is fetched with `adjusted=false` so adjustment stays ours and auditable.
 - **Collect-and-continue on partial batch failure** (ADR-0011), then fail the run inside the ledger. Committed work survives; no incomplete batch is ever recorded `SUCCESS`.
+- **The API resolves tickers point-in-time, never by bare equality** (ADR-0009). One resolver in `src/api/resolution.py`, bounded by valid time as of `as_of`. Zero matches 404s, several 409s. Do not "simplify" it to `where ticker = :ticker` — that form cannot fail, which is the entire problem.
+- **`price_type` is required and has no default** (ADR-0009). There is no `?adjusted=true` and there never will be; a default would be the API choosing a series for the caller. `total_return_adjusted` serves NULL for open/high/low/vwap on purpose — do not "complete" the map from the split-adjusted columns.
+- **Money leaves the API as a JSON string, not a number** (ADR-0009). JSON numbers are doubles; these are decimals.
+- **The API is sync SQLAlchemy on purpose** (ADR-0009). One engine, one idiom, shared with ingestion. The revisit trigger is measured pool-checkout queuing, not taste.
 - **dbt and Python are pinned to stable ranges** (ADR-0010). Not upgradeable casually — read that ADR first.
 - **`docker-compose.yml` belongs at repo root.** `docker/` holds *inputs* to compose.
 
@@ -157,6 +197,8 @@ Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003 (+ its SQL addendum), 000
 - **`DISTINCT ON` over the conflict key is required, not defensive.** Postgres raises *"ON CONFLICT DO UPDATE command cannot affect row a second time"* if one statement presents two rows with the same key, and vendors do return intra-batch duplicates.
 - **pandas sentinels must become `None` before psycopg2 sees them.** `pd.NA` raises; `float('nan')` is adapted to a literal Postgres `NaN` that `NUMERIC` silently accepts — a missing `vwap` would land as NaN, not NULL, and poison every aggregate. `to_records()` handles this.
 - **Every pipeline run goes through `RunLedger`**, which never swallows exceptions.
+- **API errors go through `ApiException` subclasses in `src/api/errors.py`**, never bare `HTTPException`. The status code and the stable `ErrorCode` slug live together on the class, so a raise site states the whole contract in one place. Every non-2xx body — including 422s and routing 404s — uses the same envelope.
+- **Typed responses where a consumer depends on the shape; untyped where the promise would be a lie.** `/securities` and `/prices` have Pydantic models; `/pipeline/runs` is `response_model=None` because `metadata` is free-form JSONB and the endpoint is operational.
 - **Timestamps:** Polygon daily bars are midnight UTC of the trading date. Use the UTC date directly; converting to ET shifts the date back a day. Regression test exists.
 - **Volume is fractional, not integral.** `raw.prices.volume` is `NUMERIC(20,6)`; `round(volume)::bigint` happens in staging. Regression test exists.
 - **Money is `Decimal`, never float.** Adjustment factors multiply, so float error compounds along the chain.
@@ -175,8 +217,8 @@ Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003 (+ its SQL addendum), 000
 1. ✅ **Foundation** — Docker, Postgres, run ledger, Polygon adapter
 2. ✅ **Reference data** — security master, corporate actions, trading calendar → tagged `v0.2`
 3. ✅ **Transform layer** — dbt intermediate → marts, adjusted prices in SQL → tagged `v0.3`
-4. API layer — FastAPI + point-in-time prices endpoint → tag `v0.5` ← *next*
-5. Completeness — remaining adapters (Yahoo, Alpha Vantage, FRED), Prefect orchestration
+4. ✅ **API layer** — FastAPI + point-in-time prices endpoint → tagged `v0.5`
+5. Completeness — remaining adapters (Yahoo, Alpha Vantage, FRED), Prefect orchestration ← *next*
 6. Polish — Streamlit dashboard, CI/CD
 7. Release — docs, ADRs, clean-environment test → tag `v1.0`
 
