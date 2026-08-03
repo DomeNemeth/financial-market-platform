@@ -1,0 +1,153 @@
+version: 2
+
+models:
+  - name: dim_macro_series
+    description: >
+      The macro series dimension. Grain: one row per series_id.
+
+      The natural key is the primary key — no surrogate, and unlike dim_security
+      that is not a simplification. A FRED series ID is assigned once by a single
+      authority, globally unique, and never reused, so none of the three
+      properties that force a surrogate for securities apply. See
+      migrations/0005_macro_data.sql.
+    columns:
+      - name: series_id
+        description: "FRED's native ID, e.g. UNRATE. The primary key."
+        tests:
+          - unique
+          - not_null
+      - name: title
+        tests:
+          - not_null
+      - name: units_short
+        description: >
+          What the numbers mean. Load-bearing rather than decorative: GDP is
+          billions of dollars, UNRATE a percent, CPIAUCSL an index on an
+          arbitrary 1982-84 base. Plotting them on one axis is meaningless and
+          nothing in the values says so.
+      - name: frequency_rank
+        description: >
+          Sortable frequency ordering, 1 (daily) to 7 (annual). FRED's own
+          strings are not orderable — alphabetically 'M' < 'Q' < 'W' puts weekly
+          last, which is backwards.
+      - name: is_annualised_rate
+        description: >
+          True for SAAR series. Seasonally adjusted AND annualised, so not
+          comparable with a plain SA series without knowing it.
+        tests:
+          - not_null
+      - name: supports_point_in_time_join
+        description: >
+          Whether FRED publishes initial-release history for this series, and
+          therefore whether it can appear in fct_security_price_macro_context.
+          False for calculated series (T10Y2Y, a spread) and for the daily
+          constant-maturity Treasury series. Those are EXCLUDED from the
+          point-in-time join rather than joined with an assumed lag — inventing
+          a publication date is the same category of error as fabricating a
+          CUSIP or a vwap.
+        tests:
+          - not_null
+      - name: missing_value_count
+        description: >
+          How many of FRED's '.' sentinels this series carries. Expected for
+          daily series (one per market holiday); a large count on a monthly
+          series would be a real gap.
+        tests:
+          - not_null
+
+  - name: fct_macro_observation
+    description: >
+      The macro observation fact. Grain: one row per (series_id, observation_date).
+
+      Keeps the vendor's own grain rather than resampling onto a daily calendar:
+      a quarterly GDP print is one observation, not sixty-three identical ones.
+      The grain mismatch with daily prices is resolved in
+      fct_security_price_macro_context, and only there.
+
+      Carries both time axes under unambiguous names — observation_date is valid
+      time (the period described), first_published_date is system time (when it
+      could first be known).
+    columns:
+      - name: series_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_macro_series')
+                field: series_id
+      - name: observation_date
+        description: >
+          START OF THE PERIOD the value describes, not the publication date.
+          January 2026's UNRATE is dated 2026-01-01 and was published 2026-02-11.
+        tests:
+          - not_null
+      - name: value
+        description: >
+          NULL where FRED reported its '.' sentinel — genuinely no observation.
+          Never zero for a missing value; DGS10's 2026-07-03 hole is the
+          observed Independence Day holiday, and a 0.0 there would be a
+          ten-year Treasury yield of zero percent.
+      - name: first_published_date
+        description: >
+          When the first estimate for this period became available, from FRED's
+          output_type=4 initial-release history. NULL for series FRED tracks no
+          releases for.
+      - name: publication_lag_days
+        description: >
+          first_published_date - observation_date. The size of the look-ahead
+          bias a naive join would introduce. ~35 days for UNRATE, ~121 for GDP.
+      - name: is_missing_observation
+        tests:
+          - not_null
+
+  - name: fct_security_price_macro_context
+    description: >
+      Daily price bars joined to the macro data ACTUALLY PUBLISHED by that
+      trading date. Grain: one row per (security_id, trading_date, series_id).
+
+      An ASOF join on first_published_date, not on observation_date. The naive
+      form — most recent observation whose PERIOD began on or before the bar —
+      attaches January's unemployment rate to trading days in January, when
+      nobody knew it. Measured lags run from ~26 days (UMCSENT) to ~121 days
+      (GDP, max 175), so the leak is large and it flatters a backtest.
+
+      WHAT THIS STILL DOES NOT FIX: macro_value is the LATEST revision, not the
+      value as first published. Look-ahead about a number's EXISTENCE is removed;
+      look-ahead about its VALUE is not. Same boundary ADR-0009 draws for the
+      API's as_of. See ADR-0012.
+    columns:
+      - name: security_id
+        tests:
+          - not_null
+      - name: trading_date
+        tests:
+          - not_null
+      - name: series_id
+        description: "Only series with supports_point_in_time_join appear here."
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_macro_series')
+                field: series_id
+      - name: macro_value
+        description: >
+          The latest revision of the most recently PUBLISHED observation as of
+          this trading date. NULL for a bar earlier than the series' first
+          publication — the join is LEFT so the price bar survives rather than
+          being deleted by the macro layer.
+      - name: macro_first_published_date
+        description: >
+          When the attached value was first released. Never after trading_date;
+          assert_macro_context_has_no_lookahead is the invariant.
+      - name: macro_vintage_date
+        description: >
+          Which revision macro_value is. Carried on every row so a consumer can
+          see what they are holding rather than assume it is the original print.
+      - name: days_since_publication
+        description: >
+          How long the market has had this number. Distinct from
+          observation_age_days, which is how old the economic period is; the two
+          differ by the publication lag and consumers need both.
+      - name: observation_age_days
+        description: "trading_date - macro_observation_date. How old the period is."

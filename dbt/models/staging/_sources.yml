@@ -110,3 +110,63 @@ sources:
             description: "Denominator of the split ratio."
           - name: cash_amount
             description: "Dividend per share, in `currency`."
+
+      - name: macro_series
+        description: >
+          FRED series metadata. Grain: one row per (series_id, source).
+          series_id is FRED's own ID used directly — no surrogate. See the
+          header of migrations/0005_macro_data.sql for why the ADR-0007
+          reasoning that forces a surrogate for securities does not apply here.
+        columns:
+          - name: series_id
+            description: "FRED's native series ID, e.g. UNRATE. Permanent and never reused."
+            tests:
+              - not_null
+          - name: units
+            description: >
+              What the numbers mean. Load-bearing: GDP is billions of dollars,
+              UNRATE is a percent, CPIAUCSL is an index on an arbitrary
+              1982-84=100 base. Nothing in the values themselves says so.
+          - name: seasonal_adjustment_short
+            description: >
+              SA | NSA | SAAR. A seasonally adjusted and an unadjusted series of
+              the same quantity are different series, and confusing them is the
+              macro analogue of confusing ADR-0003's two adjusted price series.
+
+      - name: macro_observations
+        description: >
+          FRED observations. Grain: one row per
+          (series_id, observation_date, source).
+
+          observation_date is the START OF THE PERIOD, not the publication date —
+          January 2026's unemployment rate is dated 2026-01-01 and was first
+          published 2026-02-11. first_published_date carries the real one.
+        columns:
+          - name: series_id
+            tests:
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('raw', 'macro_series')
+                    field: series_id
+          - name: observation_date
+            description: "Start of the period the value describes. NOT when it became known."
+            tests:
+              - not_null
+          - name: value
+            description: >
+              NULL means FRED reported its '.' missing sentinel — a market
+              holiday in a daily series, or a period a survey did not run.
+              Never zero: DGS10 carries a '.' on 2026-07-03 and a 0.0 there is a
+              ten-year Treasury yield of zero percent.
+          - name: first_published_date
+            description: >
+              When the FIRST estimate for this period became available, from
+              FRED's output_type=4 initial-release history. The column that
+              makes a point-in-time join possible. NULL for calculated series
+              such as T10Y2Y, which FRED tracks no releases for.
+          - name: vintage_date
+            description: >
+              Which vintage `value` is from. `value` is the LATEST revision, so
+              a join on first_published_date removes look-ahead about a number's
+              existence but not about its value. See ADR-0012.

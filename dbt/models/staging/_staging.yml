@@ -72,3 +72,52 @@ models:
           - accepted_values:
               arguments:
                 values: ['yahoo']
+
+  - name: stg_fred__series
+    description: >
+      Staged FRED series metadata. Grain: one row per series_id.
+      Renaming and casting, plus a sortable frequency rank — FRED's own
+      frequency strings are not orderable.
+    columns:
+      - name: series_id
+        tests:
+          - unique
+          - not_null
+      - name: title
+        tests:
+          - not_null
+      - name: frequency_rank
+        description: "1 (daily) to 7 (annual). NULL if FRED sends a frequency we do not map."
+      - name: is_annualised_rate
+        tests:
+          - not_null
+
+  - name: stg_fred__observations
+    description: >
+      Staged FRED observations. Grain: one row per (series_id, observation_date).
+
+      NO sanity filter on `value`, deliberately, unlike every other staging model
+      here. Macro series share no sign or range invariant — T10Y2Y is a spread
+      and is legitimately negative, which is what an inverted yield curve is — so
+      a `value > 0` filter copied from the price models would delete exactly the
+      observations anyone cares about. And a NULL value is DATA (FRED's '.'
+      sentinel), not corruption, so filtering it would make a daily series look
+      gap-free while deleting every market holiday.
+    columns:
+      - name: series_id
+        tests:
+          - not_null
+      - name: observation_date
+        description: "Start of the period described. NOT the publication date."
+        tests:
+          - not_null
+      - name: is_missing_observation
+        description: "True where FRED reported '.'. Distinguished from 'no row at all'."
+        tests:
+          - not_null
+      - name: publication_lag_days
+        description: >
+          first_published_date - observation_date. NULL for series with no
+          initial-release history. Materialised because it is the size of the
+          look-ahead bias a naive join would introduce, and a value left to be
+          re-derived is a value nobody looks at.
