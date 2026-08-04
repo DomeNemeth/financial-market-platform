@@ -30,7 +30,11 @@ dependencies = [
     "pandas>=2.0",
     "exchange-calendars>=4.5",
     "streamlit>=1.33",
-    "prefect>=2.19",
+    # 3.x, not the previous unbounded >=2.19. The deployment API differs
+    # materially between the two lines — `prefect deploy` / work pools / the
+    # `flow.serve` model are all 3.x shapes — so an unbounded floor would have
+    # resolved to either and silently broken orchestration/. See ADR-0005.
+    "prefect>=3.0,<4",
 ]
 
 [project.optional-dependencies]

@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from src.ingestion.adapters.yahoo import YahooAdapter
+from src.ingestion.adapters.yahoo import YahooAdapter, is_incomplete_session_bar
 
 
 def load_fixture(filename: str) -> dict:
@@ -172,6 +172,86 @@ class TestYahooAdapterFetch:
         # 2026-06-15T00:00:00Z is BEFORE that session's 13:30Z bar, so the last
         # requested day would be missing from every fetch.
         assert params["period2"] - params["period1"] == 7 * 86400
+
+
+class TestIncompleteSessionBars:
+    """
+    Yahoo returns a bar for the CURRENT session while it is still trading;
+    Polygon does not. During market hours that partial bar is therefore the only
+    source for today and wins the fallback slot unopposed under ADR-0006.
+
+    The constants below are a real capture from 2026-08-04, when this was caught
+    in the warehouse: AAPL's bar for that date had a volume of 25.2M against the
+    previous session's 74.8M, because the session was about a third done.
+    """
+
+    # NYSE regular session on 2026-08-04, from Yahoo's currentTradingPeriod.
+    SESSION_START = 1785850200   # 13:30Z  09:30 EDT
+    SESSION_END = 1785873600     # 20:00Z  16:00 EDT
+    MID_SESSION = 1785861015     # 16:30Z  the live regularMarketTime observed
+    META = {"currentTradingPeriod": {"regular": {
+        "start": SESSION_START, "end": SESSION_END,
+    }}}
+
+    def test_live_bar_during_the_session_is_incomplete(self):
+        assert is_incomplete_session_bar(
+            self.MID_SESSION, self.META, now_timestamp=self.MID_SESSION + 1
+        )
+
+    def test_same_bar_is_complete_once_the_session_has_closed(self):
+        """
+        The half of the condition that stops this test being a blanket 'drop
+        today'. After the close the bar is settled and wanted; a rule keyed only
+        on the date would discard it until midnight.
+        """
+        assert not is_incomplete_session_bar(
+            self.MID_SESSION, self.META, now_timestamp=self.SESSION_END + 1
+        )
+
+    def test_completed_earlier_session_is_never_dropped(self):
+        """
+        A finished bar is stamped at its own session OPEN, which is outside the
+        CURRENT trading period, so the window test excludes it regardless of the
+        time of day.
+        """
+        yesterday_open = self.SESSION_START - 86400
+        assert not is_incomplete_session_bar(
+            yesterday_open, self.META, now_timestamp=self.MID_SESSION
+        )
+
+    def test_missing_metadata_keeps_the_bar(self):
+        """
+        Safe direction. Keeping a possibly-partial bar is recoverable — the
+        trailing window re-fetches and the idempotent load overwrites it with
+        settled values — whereas dropping bars because a field was absent would
+        silently shorten every series.
+        """
+        assert not is_incomplete_session_bar(self.MID_SESSION, {}, now_timestamp=self.MID_SESSION)
+        assert not is_incomplete_session_bar(
+            self.MID_SESSION, {"currentTradingPeriod": {}}, now_timestamp=self.MID_SESSION
+        )
+
+    def test_fetch_drops_the_in_progress_bar_and_keeps_the_rest(self):
+        """
+        End to end through fetch(), with the fixture's last bar rewritten to look
+        like a live one. Non-vacuity: the four earlier bars must survive, so a
+        rule that simply dropped everything would fail this.
+        """
+        fixture = load_fixture(FIXTURE)
+        result = fixture["chart"]["result"][0]
+        result["meta"]["currentTradingPeriod"] = {"regular": {
+            "start": result["timestamp"][-1] - 3600,
+            # Far enough ahead that the session is open whenever this test runs.
+            "end": 4102444800,   # 2100-01-01
+        }}
+
+        adapter = YahooAdapter()
+        with patch.object(adapter, "_get", return_value=fixture):
+            df = adapter.fetch("KLAC", date(2026, 6, 9), date(2026, 6, 15))
+
+        assert len(df) == 4
+        assert date(2026, 6, 15) not in set(df["trading_date"])
+        assert date(2026, 6, 12) in set(df["trading_date"])
 
 
 class TestYahooAdapterNoDataStatus:

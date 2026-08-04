@@ -1,0 +1,66 @@
+# Prefect deployment definition — ADR-0005.
+#
+# Local deployment: `prefect deploy` registers this against a locally-running
+# Prefect server, and a local worker executes it on the schedule below. No
+# Prefect Cloud account, no external dependency, nothing needing admin rights.
+#
+# ----------------------------------------------------------------------------
+# RUNNING IT (three terminals, in this order — see README):
+#
+#   1. prefect server start
+#   2. prefect worker start --pool local-process
+#   3. prefect deploy --all          (once, to register)
+#
+# Then `prefect deployment run 'daily-ingest/nightly'` to trigger by hand, or
+# wait for the schedule.
+#
+# ----------------------------------------------------------------------------
+# WHY A PROCESS WORK POOL AND NOT DOCKER
+#
+# The flow shells out to dbt and reads .env through pydantic-settings, both of
+# which expect the repo checkout and the project venv. A Docker work pool would
+# need the image to carry both, which duplicates docker-compose's app image for
+# no benefit — the flow is not a service and does not need to be one. ADR-0005
+# is explicit that a local worker is a process someone keeps running, and does
+# not claim high availability.
+
+name: financial-market-platform
+prefect-version: 3.8.1
+
+deployments:
+  - name: nightly
+    version: 0.7.0
+    tags: [production, ingestion]
+    description: >
+      Ingest Polygon, Yahoo and FRED, then rebuild and test the warehouse.
+      Fails the run if any source failed; skips dbt only if ALL of them did.
+    entrypoint: orchestration/flows/daily_ingest.py:daily_ingest
+
+    # No parameters. Every default is computed at run time by the flow itself —
+    # the ticker universe from raw.security_master (so a newly-tracked security
+    # is picked up with no edit here), and the date window as a trailing 5 days
+    # ending today. Pinning them in the deployment would freeze the universe at
+    # whatever it was on the day this file was written.
+    parameters: {}
+
+    work_pool:
+      name: local-process
+      work_queue_name: default
+      job_variables:
+        # Run from the repo root so the flow's relative paths (dbt/, data/,
+        # .env) resolve, and so pydantic-settings finds .env at import.
+        working_dir: "."
+
+    schedules:
+      # 22:00 UTC = 18:00 EDT / 17:00 EST — comfortably after the 16:00 ET
+      # close, including the 13:00 ET half-days, so the session Yahoo would
+      # otherwise report as in-progress has settled. The adapter drops an
+      # unfinished session anyway (see is_incomplete_session_bar), so a mistimed
+      # run loses nothing; it just means today's bar waits for tomorrow.
+      #
+      # Weekdays only. The exchange calendar makes a weekend run harmless — it
+      # would report zero expected sessions — but running it would put FAILED-free
+      # noise in pipeline_runs and burn FRED calls for nothing.
+      - cron: "0 22 * * 1-5"
+        timezone: "UTC"
+        active: true

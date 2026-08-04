@@ -17,10 +17,10 @@ Three concrete examples, all of which this project handles explicitly:
 | **Corporate actions** | NVDA closed at \$1,208.88 on 2024-06-07 and ~\$120 the next session after a 10:1 split | A −90% return that never happened |
 | **Vendors restate** | Today's reference data gets applied to yesterday's prices | Look-ahead bias — the number looks fine and is wrong |
 
-> **Status: Phase 4 of 7.** Ingestion, reference data, the dbt transform layer,
-> and the point-in-time API are complete and tested against live vendor data.
-> Remaining: additional vendors, orchestration, and CI. See
-> [Honest status](#honest-status) before evaluating this.
+> **Status: Phase 5 of 7.** Ingestion from three vendors, reference data, the
+> dbt transform layer, the point-in-time API, and nightly Prefect orchestration
+> are complete and tested against live vendor data. Remaining: a dashboard and
+> CI. See [Honest status](#honest-status) before evaluating this.
 
 ---
 
@@ -132,6 +132,49 @@ asserted.
 `scripts/dbt.ps1` exists because dbt's `env_var()` reads real OS environment
 variables, not `.env`. Call it rather than bare `dbt`. On CI, where variables are
 set natively, `dbt` works directly.
+
+---
+
+## Running it nightly
+
+Everything above in one command — ingest all three vendors, then rebuild and
+test the warehouse:
+
+```bash
+python -m orchestration.flows.daily_ingest
+```
+
+Or as a scheduled deployment (three terminals, in this order):
+
+```bash
+prefect server start
+prefect worker start --pool local-process
+prefect deploy --all                        # once, to register
+prefect deployment run 'daily-ingest/nightly'
+```
+
+The schedule is `0 22 * * 1-5` UTC — after the 16:00 ET close, weekdays only.
+
+Three things the flow does that a shell script wrapping the same four commands
+would get wrong, all decided in [ADR-0005](docs/adr/0005-prefect-for-orchestration.md):
+
+- **A dbt `WARN` does not fail the run; a `FAIL` or `ERROR` does.** The flow
+  parses `run_results.json` rather than reading dbt's exit code, because this
+  project has a permanent and *correct* warning and one bit cannot tell it apart
+  from a real failure. It also checks the artifact is newer than the run that
+  should have written it — a stale one reports a clean build for a dbt that died
+  before starting.
+- **dbt still runs when one vendor fails**, because the Yahoo fallback exists so
+  that Polygon failing is survivable. It is skipped only when *every* source
+  failed, which is systemic and where a rebuild would bury the real cause under
+  a downstream data-quality failure.
+- **A partial-batch failure is never retried.** Under
+  [ADR-0011](docs/adr/0011-ingestion-failure-policy.md) it is raised only after
+  the successful tickers have committed, so retrying re-pays Polygon's
+  five-requests-per-minute rate limit to re-attempt a deterministic failure.
+
+Each run writes one parent row in `pipeline_runs` and a child row per step, so
+`/pipeline/runs` answers both "did last night work" and "which source broke".
 
 ---
 
@@ -257,9 +300,11 @@ Written up as ADRs, with the alternatives that were rejected and why:
 | [0010](docs/adr/0010-dependency-and-runtime-pinning.md) | Stable-only dependency ranges and a pinned interpreter |
 | [0011](docs/adr/0011-ingestion-failure-policy.md) | Collect-and-continue on partial failure, then fail the run |
 
-ADRs **0005** (orchestration) and **0006** (source priority) are still stubs —
-that subject matter is genuinely undecided, and the files are placeholders rather
-than documentation.
+All twelve ADRs are written; none are stubs. [0005](docs/adr/0005-prefect-for-orchestration.md)
+covers Prefect and what a dbt failure means to a flow,
+[0006](docs/adr/0006-source-priority-and-conflict.md) source priority and
+cross-source conflict, and [0012](docs/adr/0012-macro-data-vintages.md) macro
+publication lag and the vintage limitation.
 
 Two decisions that are load-bearing enough to summarise here:
 
@@ -294,16 +339,19 @@ silently. They are measured and documented in the
 migrations/          Numbered, forward-only, checksummed SQL migrations
 src/
   common/            config, database, logging, TLS, trading calendar, migrate
-  ingestion/         Polygon adapter, security master, corporate actions, run ledger
+  ingestion/         Polygon + Yahoo adapters, FRED, security master, corporate actions, run ledger
   transforms/        Pure-Python adjusted-price reference implementation
   api/               FastAPI app: resolution, routers, response schemas
 dbt/
   models/staging/       Per-source staging models
   models/intermediate/  Identity resolution, calendar checks, adjustment maths
-  models/marts/         dim_security, fct_security_price_daily
+  models/marts/         dim_security, fct_security_price_daily, macro marts + ASOF join
   snapshots/         SCD2 security master history
   seeds/             Committed trading calendar
   tests/             Singular data tests
+orchestration/
+  flows/             Prefect flows (daily_ingest)
+prefect.yaml         Deployment definition and cron schedule
 docs/adr/            Architecture decision records
 tests/unit/          No network, no database
 tests/integration/   Needs the stack and a live API key
@@ -329,10 +377,15 @@ point-in-time API over `dim_security` and `fct_security_price_daily` ·
 
 **Not built yet:**
 
-- **One vendor.** Yahoo, Alpha Vantage, and FRED adapters are Phase 5, which is
-  also when the per-source staging convention starts paying for itself.
-- **No orchestration.** Ingestion is CLI-driven; Prefect is Phase 5.
+- **Alpha Vantage.** Polygon (primary), Yahoo (fallback) and FRED (macro) are
+  in. Alpha Vantage was in the original Phase 5 scope and is not built. The
+  merge layer it would plug into is finished and vendor-agnostic — adding it is
+  one staging model plus one line in `int_prices_merged`'s priority `case` — so
+  it is deferred rather than blocked.
 - **No CI.** `.github/workflows/` is empty.
+- **No dashboard.** Streamlit is Phase 6.
+- **The Prefect worker is a process someone must keep running.** A laptop
+  deployment is not high availability, and ADR-0005 says so.
 - **No auth, no rate limiting, no pagination on the API.** `/prices` caps a
   response at 5,000 bars and *rejects* anything larger rather than truncating it;
   pagination will replace that cap rather than sit beside it.
@@ -378,7 +431,7 @@ point-in-time API over `dim_security` and `fct_security_price_daily` ·
 2. ✅ Reference data — security master, corporate actions, trading calendar
 3. ✅ Transform layer — dbt intermediate → marts, adjusted prices in SQL
 4. ✅ API layer — point-in-time prices endpoint → `v0.5`
-5. ⬜ Completeness — remaining adapters, Prefect orchestration
+5. ✅ Completeness — Yahoo fallback, FRED macro, Prefect orchestration → `v0.7`
 6. ⬜ Polish — Streamlit dashboard, CI/CD
 7. ⬜ Release — docs, clean-environment test → `v1.0`
 

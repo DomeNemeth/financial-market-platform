@@ -49,6 +49,12 @@ class FakeAdapter(PolygonAdapter):
 
     SOURCE_NAME = TEST_SOURCE
 
+    #: No inter-ticker wait. The real 12s is Polygon's 5-request/minute tier,
+    #: which this double never touches. Declared on the adapter because that is
+    #: where the CLI reads it from since Phase 5 — the limit is a property of
+    #: the vendor, and Yahoo's differs from Polygon's.
+    RATE_LIMIT_SLEEP = 0
+
     #: Tickers whose fetch raises, simulating a vendor error for one symbol.
     failing: set[str] = {BAD}
 
@@ -76,9 +82,21 @@ class FakeAdapter(PolygonAdapter):
 
 @pytest.fixture
 def fast_cli(monkeypatch):
-    """Swap in the fake adapter and drop the 12s inter-ticker rate-limit sleep."""
-    monkeypatch.setattr(ingest_cli, "PolygonAdapter", FakeAdapter)
-    monkeypatch.setattr(ingest_cli, "RATE_LIMIT_SLEEP", 0)
+    """
+    Swap in the fake adapter for the whole CLI.
+
+    Patches the ADAPTERS REGISTRY, not the module-level PolygonAdapter name.
+    Since the CLI gained --source it resolves its adapter through that registry,
+    which binds the real class at import time — so patching the name would leave
+    the registry untouched and every test in this file would silently make real
+    Polygon calls for tickers (ZZGOODA, ZZBAD, ZZGOODB) that do not exist. The
+    assertions would then be measuring the wrong thing while still passing or
+    failing for unrelated reasons.
+
+    The rate-limit sleep is no longer a module constant; it lives on the adapter,
+    and FakeAdapter sets it to 0.
+    """
+    monkeypatch.setattr(ingest_cli, "ADAPTERS", {"polygon": FakeAdapter})
 
 
 @pytest.fixture

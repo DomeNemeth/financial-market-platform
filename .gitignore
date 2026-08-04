@@ -29,3 +29,6 @@ dbt/profiles.yml
 # === OS ===
 .DS_Store
 Thumbs.db
+# Prefect local server database and artifacts
+.prefect/
+prefect.db*

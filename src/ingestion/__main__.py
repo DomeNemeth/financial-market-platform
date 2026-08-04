@@ -76,6 +76,97 @@ def ingest_ticker(
     return rows, gaps
 
 
+def run_ingestion(
+    source: str,
+    tickers: list[str],
+    start: date,
+    end: date,
+    parent_run_id: str | None = None,
+) -> int:
+    """
+    Ingest one vendor over [start, end]. Returns the number of rows written.
+
+    The whole of the CLI's behaviour except argument parsing, so that the
+    Prefect flow and the command line share one implementation of the run —
+    including the ledger row, the ADR-0011 collect-and-continue loop, and the
+    gap reporting. A flow that reimplemented any of that would be a second
+    place for the failure policy to drift.
+
+    Raises PartialIngestionError if any ticker failed, AFTER every ticker has
+    been attempted and the successful ones committed. The exception is raised
+    inside the ledger context, so the run is recorded FAILED with an accurate
+    partial row count (ADR-0011).
+
+    `parent_run_id` links this run to an orchestrating flow's ledger row. None
+    when invoked from the CLI, which stays a first-class entrypoint.
+    """
+    expected = session_count(start, end)
+    logger.info(
+        f"Starting ingestion | source={source} | {start} → {end} "
+        f"({expected} sessions) | {len(tickers)} ticker(s)"
+    )
+
+    adapter = ADAPTERS[source]()
+    failures: dict[str, str] = {}
+    all_gaps: dict[str, list[date]] = {}
+    total_rows = 0
+
+    with RunLedger(
+        flow_name=f"{source}_ohlcv",
+        metadata={
+            "source": source,
+            "tickers": tickers,
+            "start": str(start),
+            "end": str(end),
+            "expected_sessions": expected,
+        },
+        parent_run_id=parent_run_id,
+    ) as ledger:
+        for i, ticker in enumerate(tickers):
+            logger.info(f"[{i+1}/{len(tickers)}] Ingesting {ticker}")
+
+            try:
+                rows, gaps = ingest_ticker(adapter, ticker, start, end)
+                total_rows += rows
+                if gaps:
+                    all_gaps[ticker] = gaps
+                    logger.warning(
+                        f"  {ticker}: {rows} rows, but {len(gaps)}/{expected} sessions "
+                        f"missing (first: {gaps[0]}, last: {gaps[-1]})"
+                    )
+                else:
+                    logger.info(f"  {ticker}: {rows} rows, all {expected} sessions present")
+
+            except Exception as exc:
+                # Collect and continue (ADR-0011). Each ticker's load committed
+                # in its own transaction, so completed work is durable; the run
+                # is still failed below so the ledger never reports SUCCESS for
+                # an incomplete batch.
+                failures[ticker] = f"{type(exc).__name__}: {exc}"
+                logger.error(f"  {ticker}: FAILED — {exc}")
+
+            if i < len(tickers) - 1:
+                time.sleep(adapter.RATE_LIMIT_SLEEP)
+
+        ledger.record_rows(total_rows)
+
+        if failures:
+            summary = "; ".join(f"{t} ({e})" for t, e in failures.items())
+            raise PartialIngestionError(
+                f"{len(failures)}/{len(tickers)} tickers failed: {summary}. "
+                f"{total_rows} rows from {len(tickers) - len(failures)} "
+                "successful tickers were committed."
+            )
+
+    logger.info(f"Ingestion complete | total_rows={total_rows}")
+    if all_gaps:
+        logger.warning(
+            f"{len(all_gaps)} ticker(s) have session gaps — this is expected for "
+            "securities not listed across the whole range, and a real problem otherwise."
+        )
+    return total_rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Ingest OHLCV data from a vendor into raw Parquet + Postgres"
@@ -112,69 +203,7 @@ def main() -> None:
     if start > end:
         parser.error(f"--start {start} is after --end {end}")
 
-    expected = session_count(start, end)
-    logger.info(
-        f"Starting ingestion | source={args.source} | {start} → {end} "
-        f"({expected} sessions) | {len(args.tickers)} ticker(s)"
-    )
-
-    adapter = ADAPTERS[args.source]()
-    failures: dict[str, str] = {}
-    all_gaps: dict[str, list[date]] = {}
-    total_rows = 0
-
-    with RunLedger(
-        flow_name=f"{args.source}_ohlcv",
-        metadata={
-            "source": args.source,
-            "tickers": args.tickers,
-            "start": str(start),
-            "end": str(end),
-            "expected_sessions": expected,
-        },
-    ) as ledger:
-        for i, ticker in enumerate(args.tickers):
-            logger.info(f"[{i+1}/{len(args.tickers)}] Ingesting {ticker}")
-
-            try:
-                rows, gaps = ingest_ticker(adapter, ticker, start, end)
-                total_rows += rows
-                if gaps:
-                    all_gaps[ticker] = gaps
-                    logger.warning(
-                        f"  {ticker}: {rows} rows, but {len(gaps)}/{expected} sessions "
-                        f"missing (first: {gaps[0]}, last: {gaps[-1]})"
-                    )
-                else:
-                    logger.info(f"  {ticker}: {rows} rows, all {expected} sessions present")
-
-            except Exception as exc:
-                # Collect and continue (ADR-0011). Each ticker's load committed
-                # in its own transaction, so completed work is durable; the run
-                # is still failed below so the ledger never reports SUCCESS for
-                # an incomplete batch.
-                failures[ticker] = f"{type(exc).__name__}: {exc}"
-                logger.error(f"  {ticker}: FAILED — {exc}")
-
-            if i < len(args.tickers) - 1:
-                time.sleep(adapter.RATE_LIMIT_SLEEP)
-
-        ledger.record_rows(total_rows)
-
-        if failures:
-            summary = "; ".join(f"{t} ({e})" for t, e in failures.items())
-            raise PartialIngestionError(
-                f"{len(failures)}/{len(args.tickers)} tickers failed: {summary}. "
-                f"{total_rows} rows from {len(args.tickers) - len(failures)} "
-                "successful tickers were committed."
-            )
-
-    logger.info(f"Ingestion complete | total_rows={total_rows}")
-    if all_gaps:
-        logger.warning(
-            f"{len(all_gaps)} ticker(s) have session gaps — this is expected for "
-            "securities not listed across the whole range, and a real problem otherwise."
-        )
+    run_ingestion(args.source, args.tickers, start, end)
 
 
 if __name__ == "__main__":

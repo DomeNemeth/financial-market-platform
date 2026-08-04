@@ -54,6 +54,15 @@ docker compose up -d                                    # start stack (Postgres 
 .venv\Scripts\python.exe -m src.ingestion.corporate_actions --tickers NVDA --since 2024-01-01
 .venv\Scripts\python.exe -m src.ingestion.fred --start 2015-01-01     # 10 macro series
 
+# orchestration (ADR-0005) — run the flow directly, no server needed
+.venv\Scripts\python.exe -m orchestration.flows.daily_ingest
+
+# ...or as a scheduled deployment: three terminals, in this order
+prefect server start
+prefect worker start --pool local-process
+prefect deploy --all                       # once, to register
+prefect deployment run 'daily-ingest/nightly'
+
 curl http://localhost:8000/health                       # -> {"status":"ok","db":"connected"}
 
 # API — price_type is REQUIRED; omitting it is a 422, never a default
@@ -66,40 +75,30 @@ curl 'http://localhost:8000/pipeline/runs?limit=5'
 
 ---
 
-## Where we are — Phase 5 of 7, IN PROGRESS
+## Where we are — Phase 5 of 7, complete
 
-**Phases 1–4 are complete (tagged `v0.2`, `v0.3`, `v0.5`). Phase 5 is partly done and NOT tagged.**
+**Phases 1–4 are complete (tagged `v0.2`, `v0.3`, `v0.5`). Phase 5 is complete and tagged `v0.7`.** Phase 6 (Streamlit dashboard, CI/CD) is next.
 
-Phase 5 has three additions. Two are in:
+All three Phase 5 additions are in:
 
 | Phase 5 item | Status |
 |---|---|
 | Yahoo fallback adapter + ADR-0006 merge layer | ✅ done, verified |
 | FRED macro data + point-in-time ASOF join | ✅ done, verified |
-| **Prefect orchestration (ADR-0005, `daily_ingest` flow)** | ❌ **not started** |
+| Prefect orchestration (ADR-0005, `daily_ingest` flow) | ✅ done, verified through a real worker |
 
-**Resume here:** ADR-0005 is still a template stub. The decision it owes is
-dbt-failure-severity-vs-flow-failure policy — specifically, whether a dbt `WARN`
-should fail the Prefect flow (it should not; see the 138-row warning below) and
-what a dbt `ERROR` does to a run that has already committed ingested rows.
-Then build `orchestration/flows/daily_ingest.py` wrapping ingest (all sources) →
-`dbt build` → ledger. **Scheduling decision already made: local Prefect
-deployment** (`prefect deploy` + a local worker, cron in the deployment), with
-retry behaviour proven by forcing a transient failure rather than trusting the
-decorator. Note `prefect` is installed at **3.8.1** but `pyproject.toml` still
-pins `>=2.19`; tighten it to `>=3.0`, since the deployment API differs.
-
-Everything below was verified against real data and a live database on 2026-08-03, not against fixtures.
+Everything below was verified against real data and a live database on 2026-08-04, not against fixtures.
 
 | Check | Status |
 |---|---|
-| `ruff check src/ tests/ scripts/` | ✅ clean |
-| `pytest -m "not integration"` | ✅ 52 passed (was 37; +15 Yahoo adapter) |
-| `pytest tests/integration` | ⚠️ **not re-run since the merge landed** — do this before tagging |
+| `ruff check src/ tests/ scripts/ orchestration/` | ✅ clean |
+| `pytest -m "not integration"` | ✅ 57 passed (was 37) |
+| `pytest tests/integration` | ✅ 82 passed (was 79) |
 | `dbt build` | ✅ 143 nodes, PASS=142 WARN=1 ERROR=0 |
-| Migrations | ✅ 0001–0005 applied |
-| Price data | ✅ 6 tickers, 2026-05-01 → 2026-07-31: 258 Polygon bars + 120 Yahoo fallback bars |
-| Macro data | ✅ 10 FRED series, 9,938 observations, 380 `.` sentinels → NULL |
+| Migrations | ✅ 0001–0006 applied |
+| Price data | ✅ 6 tickers, 2026-05-01 → 2026-08-03: 276 Polygon bars + 120 Yahoo fallback bars |
+| Macro data | ✅ 10 FRED series, ~49k observations, `.` sentinels → NULL |
+| Prefect | ✅ deployment registered, cron schedule active, **executed end-to-end by a real worker** |
 | `/health` | ✅ `{"status":"ok","db":"connected"}` |
 | API spot-checks | ✅ curl across the fallback/primary boundary — Yahoo bars serve `vwap: null` honestly |
 
@@ -212,10 +211,36 @@ stg_yahoo__prices   ─┴→ int_prices_with_calendar   (+source in the grain)
 - **The FRED API key is redacted before it can reach the ledger.** FRED accepts the key *only* as a query param, which contradicts this project's headers-only rule. The rule can't be honoured, so the leak is closed at the other end: `_redact()` scrubs it from every exception. Confirmed live — a real 400 from T10Y2Y logged `api_key=***REDACTED***`.
 - **3 of 10 FRED series are excluded from the point-in-time join rather than assumed.** FRED publishes no initial-release history for calculated series (`T10Y2Y`) or the daily Treasuries (`DGS10`, `DGS2`). Assuming a same-day lag would be inventing a publication date — the same error class as a fabricated CUSIP. `supports_point_in_time_join` makes the absence visible.
 
+### What Phase 5 added — orchestration
+
+**`orchestration/flows/daily_ingest.py`.** Ingest Polygon + Yahoo + FRED concurrently, then `dbt build`. The tasks call `run_ingestion()` / `run_fred_ingestion()` — the *same functions the CLIs call* — rather than shelling out, so the ADR-0011 failure policy has exactly one implementation and the CLIs stay first-class entrypoints.
+
+**A dbt `WARN` never fails the flow; a `FAIL` or `ERROR` always does** (ADR-0005). The flow parses `dbt/target/run_results.json` rather than reading the exit code, because this project has a permanent and *correct* 138-row warning and a boolean exit status cannot tell it from a real failure. Parsing also yields the counts, which land in `pipeline_runs.metadata` — recorded, deliberately **not** thresholded, because the warning count legitimately moves when the ingestion window moves.
+
+**dbt runs unless *every* source failed.** One vendor dying is survivable — that is what ADR-0006's fallback is for. All sources dying is systemic, so nothing landed and a rebuild would only surface the outage as a downstream `assert_no_missing_trading_days` failure, burying the real cause.
+
+**Parent/child ledger rows** (migration 0006, nullable self-referencing `parent_run_id`). One flow run writes one `daily_ingest` row plus a child per step, so `pipeline_runs` answers both "did last night work" and "which source broke". `parent_run_id` stays NULL for CLI runs.
+
+**Retries are layered and `PartialIngestionError` is never retried.** tenacity retries a single HTTP request inside the adapter; Prefect retries a whole task. Left alone they multiply — and worse, they compound over the wrong failure: under ADR-0011 a partial batch raises *after* the good tickers committed, so retrying re-pays Polygon's rate limit to re-attempt a deterministic failure. A `retry_condition_fn` declines it.
+
+**Scheduling is a local Prefect deployment** (`prefect.yaml`): `prefect server start`, `prefect worker start --pool local-process`, `prefect deploy --all`. Cron `0 22 * * 1-5` UTC — after the 16:00 ET close, weekdays only.
+
+### Things that earned their keep
+
+- **The first flow run reported `dbt build clean | 143 nodes` for a dbt invocation that had died outright.** dbt failed with `Env var required but not provided: 'POSTGRES_USER'` — pydantic-settings reads `.env` into `Settings`, it does **not** export to `os.environ`, so the subprocess inherited nothing. dbt then wrote no `run_results.json`, and the flow happily parsed the *previous* run's file. A flow whose entire purpose is to not lie about the result lied about it on its first real run. Fixed twice over: `_dbt_env()` supplies the variables, and `_summarise_run_results()` now requires the artifact to be **newer than the subprocess that should have written it**.
+- **Yahoo was landing in-progress session bars.** Caught in the warehouse on 2026-08-04: AAPL had a bar for that date with volume 25.2M against the previous session's 74.8M — about a third of a day, because the session was still trading. Polygon publishes nothing until the close, so during market hours that partial bar was the *only* source for today and won the fallback slot unopposed. Its "close" was just the last trade at fetch time. `is_incomplete_session_bar()` drops it, using Yahoo's own signal: a completed bar is stamped at the session **open**, the live one at `regularMarketTime`, which falls inside the current `currentTradingPeriod.regular` window.
+- **The flow's first run ingested 5 securities with no reference data.** It defaulted to `DEFAULT_TICKERS` (10 names) where the security master holds 6, so GOOGL/AMZN/META/TSLA/JNJ bars landed unresolvable — the flow would have manufactured an `assert_every_price_bar_resolves_to_a_security` failure every night. `tracked_tickers()` now derives the universe from `raw.security_master`, which makes the ordering explicit and self-maintaining: ingest a master row and the nightly flow picks the security up with no code edit.
+- **Retry behaviour is proven by forcing failures, not by trusting the decorator** (`tests/integration/test_flow_retries.py`). Three tests: a transient error retried then succeeding, `PartialIngestionError` attempted exactly **once**, and retries exhausting at 1 + 2 = 3. Non-vacuity confirmed by deleting `retry_condition_fn` — Prefect then logs "Retry 1/2", "Retry 2/2" on the partial error and the test fails. Nothing else in the suite would have noticed that deletion.
+- **A real transient failure validated the whole design mid-development.** FRED dropped the connection on `T10Y2Y`. Unplanned, and every rule fired correctly: 9/10 series committed, the ledger recorded `FAILED` with the exact cause, the error was **not** retried, dbt still ran because 2 of 3 sources succeeded, the WARN did not fail the flow, and the flow failed honestly at the end.
+- **Two ledger honesty bugs, both caught by reading the numbers rather than assuming them.** The parent row reported `rows=36` for a run whose FRED child had committed 36,245 — because `results` only holds return values of tasks that *completed*, and ADR-0011 guarantees a failed task still committed its successes. It now sums the child rows. And `dbt_build` was recording `rows_ingested=143`, a node count in a row-count field, which would have made `sum(rows_ingested)` add dbt nodes to a count of price bars. It records 0.
+- **The integration suite caught a break I introduced and would have hidden a worse one.** Moving `RATE_LIMIT_SLEEP` onto the adapter broke a monkeypatch with a loud `AttributeError` — which masked the real problem: the CLI now resolves adapters through the `ADAPTERS` registry, so patching the module-level `PolygonAdapter` name no longer affects it, and those six tests would have made **real network calls** for tickers that do not exist.
+
 ### Known issues
 
 - **No CI.** `.github/workflows/` is an empty directory. CLAUDE.md previously implied CI existed ("CI needs no wrapper"); it does not.
-- **`pytest tests/integration` has not been re-run since the merge layer landed.** The 79 integration tests passed as of Phase 4; the DAG has changed substantially since. Run before tagging.
+- **The Prefect worker is a process someone has to keep running.** A laptop deployment is not high availability, and ADR-0005 says so rather than implying otherwise. A missed run is repaired by the next one — the flow uses a trailing 5-day window and loads are idempotent — but only if something restarts the worker.
+- **Prefect's own telemetry fails on this machine.** `Failed to send telemetry: CERTIFICATE_VERIFY_FAILED` in the server log. Avast MITMs TLS and Prefect's telemetry client does not use `truststore` the way `src/common/tls.py` does. Cosmetic — it is telemetry — but it is noise in every server log and it is not a project bug.
+- **FRED is re-fetched in full every night** (~49k observations). Idempotent and correct, since a revision can touch any period, but wasteful. ADR-0005 accepted it to keep one flow and one schedule.
 - **Macro `value` is the latest revision, not the value as first published** (ADR-0012). The point-in-time join removes look-ahead about a number's *existence*, not about its *value* — the same boundary ADR-0009 draws for `as_of`. `macro_vintage_date` is carried per row so a consumer sees which revision they hold. Full replay needs every vintage stored; Phase 6.
 - **Yahoo's `adjclose` is fetched and discarded.** A third adjusted series with a methodology this project has not audited. ADR-0003 is explicit that a series called `adjusted_close` with unstated semantics is the thing the design exists to avoid.
 - **Yahoo's chart endpoint is unofficial and unauthenticated.** No SLA, no published rate limit, and it rejects default `requests` User-Agents with a spurious 429. Acceptable for a fallback; it would not be acceptable for a primary.
@@ -230,9 +255,7 @@ stg_yahoo__prices   ─┴→ int_prices_with_calendar   (+source in the grain)
 
 ## Architecture decisions — do not silently revise
 
-Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003 (+ its SQL addendum), 0004, 0006, 0007, 0008, 0009, 0010, 0011, 0012 are written.** ADR **0005** (Prefect) is still a template stub — treat its subject matter as undecided.
-
-**ADR-0005 is now the blocker**, exactly as ADR-0006 was before Phase 5. It owes one decision: what a dbt failure does to a Prefect flow. The two halves are not symmetric — a dbt `WARN` must not fail the flow (this build has a permanent, correct 138-row warning), and a dbt `ERROR` arrives *after* ingestion has already committed rows, so "fail the run" has to mean what ADR-0011 means by it: committed work survives, the ledger records `FAILED`.
+Full rationale in `docs/adr/`. **All twelve ADRs are written** — 0001–0012, including ADR-0003's SQL addendum. There are no stubs left.
 
 - **Postgres is the transform substrate** (ADR-0001). Python ingestion writes Parquet as an immutable archive **and** loads the same rows into `raw`. dbt runs entirely against Postgres. DuckDB is deliberately **not** in the critical path.
 - **Parquet is written before Postgres** (ADR-0002), so a crash leaves an archived file with no row — recoverable — rather than a row with no provenance.
@@ -250,6 +273,11 @@ Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003 (+ its SQL addendum), 000
 - **Nothing may join `int_prices_with_calendar` on `(security_id, trading_date)` alone** — `source` is in its grain and such a join fans out. Use `int_prices_merged`.
 - **Macro joins use `first_published_date`, never `observation_date`** (ADR-0012). FRED dates an observation to the start of the period it describes; joining on it leaks numbers by up to 175 days and flatters a backtest.
 - **A FRED series with no publication history is excluded from the point-in-time join, never given an assumed lag** (ADR-0012). Same rule as CUSIP and `vwap`: do not invent a plausible value.
+- **A dbt `WARN` must never fail the Prefect flow; a `FAIL` or `ERROR` always must** (ADR-0005). The flow parses `run_results.json`, not the exit code — do not "simplify" it to `returncode != 0`, which cannot distinguish the permanent correct warning from a real failure.
+- **The dbt artifact must be newer than the run that should have written it.** A stale `run_results.json` reports a clean build for a dbt that died before starting. This actually happened.
+- **`PartialIngestionError` is never retried** (ADR-0005). ADR-0011 already handled the per-item failures; a retry only re-pays the rate limit.
+- **The flow's ticker universe comes from `raw.security_master`, never from `DEFAULT_TICKERS`.** Reference data first, prices second — otherwise the flow ingests bars that can never resolve.
+- **Yahoo bars for a session still in progress are dropped, not landed.** Polygon publishes nothing until the close, so an in-progress Yahoo bar wins the merge unopposed and its "close" is not a close.
 - **Raw stays raw.** Polygon is fetched with `adjusted=false` so adjustment stays ours and auditable.
 - **Collect-and-continue on partial batch failure** (ADR-0011), then fail the run inside the ledger. Committed work survives; no incomplete batch is ever recorded `SUCCESS`.
 - **The API resolves tickers point-in-time, never by bare equality** (ADR-0009). One resolver in `src/api/resolution.py`, bounded by valid time as of `as_of`. Zero matches 404s, several 409s. Do not "simplify" it to `where ticker = :ticker` — that form cannot fail, which is the entire problem.
@@ -289,8 +317,8 @@ Full rationale in `docs/adr/`. **ADRs 0001, 0002, 0003 (+ its SQL addendum), 000
 2. ✅ **Reference data** — security master, corporate actions, trading calendar → tagged `v0.2`
 3. ✅ **Transform layer** — dbt intermediate → marts, adjusted prices in SQL → tagged `v0.3`
 4. ✅ **API layer** — FastAPI + point-in-time prices endpoint → tagged `v0.5`
-5. **Completeness** — Yahoo adapter ✅, FRED macro ✅, **Prefect orchestration ❌** ← *in progress, untagged*
-6. Polish — Streamlit dashboard, CI/CD
+5. ✅ **Completeness** — Yahoo fallback, FRED macro, Prefect orchestration → tagged `v0.7`
+6. Polish — Streamlit dashboard, CI/CD ← *next*
 7. Release — docs, ADRs, clean-environment test → tag `v1.0`
 
 Realistic timeline: 10–14 weeks part-time.

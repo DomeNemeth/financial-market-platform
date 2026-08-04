@@ -349,25 +349,22 @@ def ingest_series(
     return metadata_rows, observation_rows, missing
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Ingest FRED macroeconomic series into raw Postgres"
-    )
-    parser.add_argument(
-        "--series",
-        nargs="+",
-        default=DEFAULT_SERIES,
-        help="FRED series IDs (default: 10 headline indicators)",
-    )
-    parser.add_argument(
-        "--start",
-        type=date.fromisoformat,
-        default=None,
-        help="Earliest observation date to fetch, YYYY-MM-DD. Default: all history.",
-    )
-    args = parser.parse_args()
+def run_fred_ingestion(
+    series: list[str],
+    start: date | None = None,
+    parent_run_id: str | None = None,
+) -> int:
+    """
+    Ingest a list of FRED series. Returns the number of observations written.
 
-    logger.info(f"Starting FRED ingestion | {len(args.series)} series | start={args.start}")
+    The CLI's behaviour minus argument parsing, so the Prefect flow and the
+    command line share one implementation — including the ledger row and the
+    ADR-0011 collect-and-continue loop.
+
+    Raises PartialIngestionError if any series failed, after every series has
+    been attempted, from inside the ledger context.
+    """
+    logger.info(f"Starting FRED ingestion | {len(series)} series | start={start}")
 
     client = FredClient()
     failures: dict[str, str] = {}
@@ -376,12 +373,13 @@ def main() -> None:
 
     with RunLedger(
         flow_name="fred_macro",
-        metadata={"series": args.series, "start": str(args.start) if args.start else None},
+        metadata={"series": series, "start": str(start) if start else None},
+        parent_run_id=parent_run_id,
     ) as ledger:
-        for i, series_id in enumerate(args.series):
-            logger.info(f"[{i+1}/{len(args.series)}] Ingesting {series_id}")
+        for i, series_id in enumerate(series):
+            logger.info(f"[{i+1}/{len(series)}] Ingesting {series_id}")
             try:
-                _, observations, missing = ingest_series(client, series_id, args.start)
+                _, observations, missing = ingest_series(client, series_id, start)
                 total_observations += observations
                 total_missing += missing
                 logger.info(
@@ -401,15 +399,37 @@ def main() -> None:
         if failures:
             summary = "; ".join(f"{s} ({e})" for s, e in failures.items())
             raise PartialIngestionError(
-                f"{len(failures)}/{len(args.series)} series failed: {summary}. "
+                f"{len(failures)}/{len(series)} series failed: {summary}. "
                 f"{total_observations} observations from "
-                f"{len(args.series) - len(failures)} successful series were committed."
+                f"{len(series) - len(failures)} successful series were committed."
             )
 
     logger.info(
         f"FRED ingestion complete | observations={total_observations} "
         f"| missing={total_missing}"
     )
+    return total_observations
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Ingest FRED macroeconomic series into raw Postgres"
+    )
+    parser.add_argument(
+        "--series",
+        nargs="+",
+        default=DEFAULT_SERIES,
+        help="FRED series IDs (default: 10 headline indicators)",
+    )
+    parser.add_argument(
+        "--start",
+        type=date.fromisoformat,
+        default=None,
+        help="Earliest observation date to fetch, YYYY-MM-DD. Default: all history.",
+    )
+    args = parser.parse_args()
+
+    run_fred_ingestion(args.series, args.start)
 
 
 if __name__ == "__main__":

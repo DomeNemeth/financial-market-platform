@@ -156,8 +156,18 @@ class YahooAdapter(BaseAdapter):
         exchange_tz = ZoneInfo(result["meta"]["exchangeTimezoneName"])
 
         ingested_at = datetime.now(timezone.utc)
+        now_timestamp = ingested_at.timestamp()
         rows = []
+        skipped_incomplete = 0
         for i, ts in enumerate(timestamps):
+            # A session still in progress is not a bar. See
+            # is_incomplete_session_bar() — Polygon publishes nothing until the
+            # close, so during market hours this partial bar would be the only
+            # source for today and would win the merge unopposed.
+            if is_incomplete_session_bar(ts, result["meta"], now_timestamp):
+                skipped_incomplete += 1
+                continue
+
             close = _at(quote.get("close"), i)
 
             # Yahoo pads its arrays with nulls for sessions it has no print for
@@ -191,8 +201,17 @@ class YahooAdapter(BaseAdapter):
                 "ingested_at": ingested_at,
             })
 
+        if skipped_incomplete:
+            logger.info(
+                f"  {ticker}: skipped {skipped_incomplete} bar(s) for a session still "
+                "in progress — it will be ingested once the session has closed"
+            )
+
         if not rows:
-            logger.info(f"All {len(timestamps)} Yahoo bars for {ticker} had a null close")
+            logger.info(
+                f"All {len(timestamps)} Yahoo bars for {ticker} were dropped "
+                "(null close, or a session still in progress)"
+            )
             return self._empty_dataframe()
 
         df = pd.DataFrame(rows)
@@ -234,6 +253,53 @@ class YahooAdapter(BaseAdapter):
             "ticker", "trading_date", "open", "high", "low", "close",
             "volume", "vwap", "trade_count", "source", "ingested_at",
         ])
+
+
+def is_incomplete_session_bar(
+    bar_timestamp: int, meta: dict[str, Any], now_timestamp: float
+) -> bool:
+    """
+    True when a bar covers a session that has not finished yet.
+
+    THE BUG THIS EXISTS TO PREVENT. Yahoo returns a bar for the CURRENT session
+    while it is still trading. Polygon does not — it publishes a daily bar only
+    after the close. So during market hours Yahoo is the only source for today,
+    it wins the fallback slot unopposed under ADR-0006, and a partial session
+    lands in the warehouse as though it were a complete one.
+
+    Observed live on 2026-08-04 at 16:10 UTC: AAPL's bar for that date carried a
+    volume of 25.2M against the previous session's 74.8M — about a third of a
+    day, because the session was about a third done. Its `close` was simply the
+    last trade at the moment of the fetch. Every downstream calculation would
+    have treated it as a closing price, and nothing anywhere would have raised:
+    the row is well-formed, the date is a real session, the number looks like a
+    price. Precisely the class of silent, plausible error this project keeps
+    trying not to ship.
+
+    THE SIGNAL. Yahoo timestamps a COMPLETED daily bar at the session OPEN
+    (13:30Z under EDT). It timestamps the IN-PROGRESS bar at
+    `meta.regularMarketTime` — the moment of the last trade — which therefore
+    falls somewhere inside the current session rather than at its start. So a
+    bar whose timestamp lands within the current regular trading period, while
+    that period has not yet ended, is live and incomplete.
+
+    Both halves of the condition are needed. The window test alone would drop
+    today's bar even after the close, when it is complete and wanted. The
+    now-vs-end test alone would drop nothing on a historical fetch and
+    everything during market hours.
+
+    Returns False when `currentTradingPeriod` is absent, which is the safe
+    direction: keeping a bar that might be partial is recoverable — the next
+    day's run overwrites it with the settled values, since loads are idempotent
+    and the trailing window re-fetches — whereas dropping bars because a field
+    was missing would silently shorten every series.
+    """
+    regular = ((meta.get("currentTradingPeriod") or {}).get("regular")) or {}
+    start, end = regular.get("start"), regular.get("end")
+    if start is None or end is None:
+        return False
+
+    return start <= bar_timestamp < end and now_timestamp < end
 
 
 def _at(values: list | None, i: int) -> Any:
