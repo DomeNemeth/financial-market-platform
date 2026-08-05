@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from src.api.errors import register_error_handlers
-from src.api.routers import health, pipeline, prices, securities
+from src.api.routers import corporate_actions, health, pipeline, prices, securities
 from src.common.database import engine
 from src.common.logging import configure_logging
 
@@ -46,7 +46,7 @@ app = FastAPI(
         "IEEE-754 double; these are decimals and are serialised losslessly. Parse "
         "them as decimals."
     ),
-    version="0.5.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 
@@ -55,4 +55,5 @@ register_error_handlers(app)
 app.include_router(health.router)
 app.include_router(securities.router)
 app.include_router(prices.router)
+app.include_router(corporate_actions.router)
 app.include_router(pipeline.router)

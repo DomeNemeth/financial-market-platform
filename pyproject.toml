@@ -29,7 +29,13 @@ dependencies = [
     "pyarrow>=16.0",
     "pandas>=2.0",
     "exchange-calendars>=4.5",
-    "streamlit>=1.33",
+    "streamlit>=1.36",
+    # Charting for the dashboard. Streamlit bundles Altair, which would have
+    # served the line charts, but not the two things this dashboard needs most:
+    # dated vertical annotations with labels (corporate actions on a price
+    # series) and a range selector. Pinned above 5.20 for `add_vline` accepting
+    # a date-typed x, which is what the annotation layer is built on.
+    "plotly>=5.20",
     # 3.x, not the previous unbounded >=2.19. The deployment API differs
     # materially between the two lines — `prefect deploy` / work pools / the
     # `flow.serve` model are all 3.x shapes — so an unbounded floor would have
@@ -68,4 +74,11 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 markers = [
     "integration: needs the Docker stack, network, and a real API key. Deselect with -m 'not integration'.",
+    # Declared rather than left to an incidental skipif. CI has no vendor keys, so
+    # a test guarded only by skipif(not settings.polygon_api_key) would skip itself
+    # silently — and the NEXT live-vendor test someone writes would not have that
+    # guard, would not be noticed, and would make real network calls from a runner.
+    # `-m 'not live_vendor'` makes the boundary opt-out rather than remember-to-add.
+    # See ADR-0013.
+    "live_vendor: calls a real vendor API. NEVER runs in CI — a vendor outage or a rate limit would turn CI red for a reason outside the diff. Run locally with -m live_vendor.",
 ]

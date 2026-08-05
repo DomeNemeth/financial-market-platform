@@ -18,7 +18,9 @@ Requires the Docker stack. Runs `dbt snapshot` as a subprocess.
 """
 
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -30,8 +32,41 @@ from src.ingestion.security_master import SecurityMasterIngestion
 pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DBT_EXE = REPO_ROOT / ".venv" / "Scripts" / "dbt.exe"
 DBT_PROJECT = REPO_ROOT / "dbt"
+
+
+def _dbt_executable() -> str:
+    """
+    Locate dbt next to the interpreter running this test.
+
+    This used to be a hard-coded `.venv/Scripts/dbt.exe`, directly under a
+    docstring claiming the test was "runnable on any platform" — a path that
+    cannot exist on Linux. Nothing caught it for three phases because nothing
+    ever ran the suite anywhere but this one Windows machine. CI found it on its
+    first run, which is a fair summary of why ADR-0013 exists.
+
+    Console scripts are installed alongside the interpreter, so the sibling of
+    `sys.executable` is the dbt belonging to *this* environment — which matters
+    more than it looks: ADR-0010 pins dbt to the 1.11 line on Python 3.11, and a
+    bare `dbt` off PATH could easily be a different install with a different
+    resolution of that pin. PATH is the fallback, not the first choice.
+    """
+    sibling = Path(sys.executable).parent / ("dbt.exe" if os.name == "nt" else "dbt")
+    if sibling.exists():
+        return str(sibling)
+
+    found = shutil.which("dbt")
+    if not found:
+        pytest.fail(
+            f"dbt not found next to {sys.executable} or on PATH. "
+            f"Install the project's dev dependencies into the active environment."
+        )
+    return found
+
+
+#: The dbt profile target. CI points this at its own service container via the
+#: `ci` output in dbt/profiles.yml.example; locally it stays `dev`.
+DBT_TARGET = os.environ.get("DBT_TARGET", "dev")
 
 # Synthetic, clearly-fake identifiers. Real composite FIGIs start "BBG".
 FIGI_ORIGINAL = "TEST00000001"
@@ -59,7 +94,11 @@ def run_dbt_snapshot() -> None:
         "POSTGRES_DB": settings.postgres_db,
     }
     result = subprocess.run(
-        [str(DBT_EXE), "snapshot", "--project-dir", str(DBT_PROJECT)],
+        [
+            _dbt_executable(), "snapshot",
+            "--project-dir", str(DBT_PROJECT),
+            "--target", DBT_TARGET,
+        ],
         env=env,
         capture_output=True,
         text=True,

@@ -1,5 +1,7 @@
 # Financial Market Platform
 
+[![CI](https://github.com/DomeNemeth/financial-market-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/DomeNemeth/financial-market-platform/actions/workflows/ci.yml)
+
 A point-in-time-correct market data warehouse: ingests daily equity bars and
 reference data from multiple vendors, reconciles them, and serves them over an
 API.
@@ -17,10 +19,18 @@ Three concrete examples, all of which this project handles explicitly:
 | **Corporate actions** | NVDA closed at \$1,208.88 on 2024-06-07 and ~\$120 the next session after a 10:1 split | A −90% return that never happened |
 | **Vendors restate** | Today's reference data gets applied to yesterday's prices | Look-ahead bias — the number looks fine and is wrong |
 
-> **Status: Phase 5 of 7.** Ingestion from three vendors, reference data, the
-> dbt transform layer, the point-in-time API, and nightly Prefect orchestration
-> are complete and tested against live vendor data. Remaining: a dashboard and
-> CI. See [Honest status](#honest-status) before evaluating this.
+> **Status: Phase 6 of 7.** Ingestion from three vendors, reference data, the
+> dbt transform layer, the point-in-time API, nightly Prefect orchestration, a
+> Streamlit dashboard, and CI are complete and tested against live vendor data.
+> Remaining: release documentation and a clean-environment test.
+> See [Honest status](#honest-status) before evaluating this.
+
+That badge is not decorative. CI builds the schema **from empty**, loads a real
+warehouse snapshot, and runs the full dbt suite and the integration suite
+against it — because most of this project's assertions are about *data*, and a
+CI run against an empty database would be green, fast, and meaningless.
+[ADR-0013](docs/adr/0013-continuous-integration-scope.md) sets out exactly what
+runs and what deliberately does not.
 
 ---
 
@@ -240,16 +250,76 @@ a shape to build against.
 
 ---
 
+## The dashboard
+
+```bash
+docker compose up -d          # Postgres + API + dashboard
+# http://localhost:8501
+```
+
+Three pages, narrowed from the five originally planned. The backend accumulated
+enough substance over five phases that a wide, shallow UI would have undersold
+it; three pages that each say something specific beat five that each show a
+table.
+
+| Page | What it is for |
+|---|---|
+| **Price series** | Daily bars in any of the three series, with corporate actions annotated on the chart. The argument for ADR-0003 in a form that does not require reading ADR-0003: the raw KLAC series shows a −90% cliff on 2026-06-12, the split-adjusted series runs straight through it, and the annotation names the 10-for-1 responsible. |
+| **Pipeline status** | The run ledger, with parent/child rows so it answers both "did last night work?" and "which source broke?". A `FAILED` run with a non-zero row count is shown as exactly that, because under ADR-0011 it is the policy working. |
+| **Data health** | Coverage and freshness per security, split by vendor. A high fallback share means `vwap` and `trade_count` are mostly absent — Yahoo does not publish them and this platform does not invent them. |
+
+**It is a thin HTTP client and holds no database credentials.** That is the
+central decision, and the shortcut was tempting: Streamlit runs Python,
+`src.common.database` is right there, and a direct `SELECT ... WHERE
+vendor_ticker = ...` would have been three lines and would have worked. It would
+also have been a second, unresolved implementation of "which security is this
+ticker" — the exact bare-ticker join that
+[`src/api/resolution.py`](src/api/resolution.py) exists to prevent —
+reintroduced at the one layer a human actually looks at. The chart would render,
+the numbers would look like prices, and nobody would see the splice.
+
+So the dashboard is the API's first real consumer, which makes it a test of the
+API's ergonomics as well as a view of the data. It required exactly one new
+endpoint, [`/corporate-actions/{ticker}`](src/api/routers/corporate_actions.py),
+which resolves through the same `resolve_security` as everything else — so
+overlaying annotations on a price series is sound rather than coincidental.
+
+**And the constraint is enforced, not merely documented.** The `dashboard`
+service deliberately does not load `.env`, so the container has no `POSTGRES_*`
+variables and no API key. Inside it, `import src.common.database` fails outright
+with a pydantic `4 validation errors for Settings`. A future refactor cannot
+quietly open a database connection from the UI, because there is nothing to
+connect with — which is a stronger guarantee than a promise in a code review.
+
+**The error paths are part of the design, not an afterthought.** A 404 explains
+that no security held the ticker *on that date* and that the fix is usually to
+move `as of`, not to retype the symbol. A 409 lays both claimants side by side
+and names it as a data defect the API refuses to guess past — the direction a
+broken implementation never even reaches, because it would have returned one of
+them and looked perfectly healthy.
+
+---
+
 ## Testing
 
 ```bash
 PY=.venv/Scripts/python.exe
 
-$PY -m pytest -m "not integration"   # 37 unit tests — no network, no database
-$PY -m pytest tests/integration      # 79 tests — needs the stack + a Polygon key
-./scripts/dbt.ps1 test               # 61 data tests
-$PY -m ruff check src/ tests/ scripts/
+$PY -m pytest -m "not integration"                        # 57 unit tests — no network, no database
+$PY -m pytest tests/integration -m "not live_vendor"      # 80 tests — needs the stack; no vendor calls
+$PY -m pytest tests/integration -m live_vendor            # 13 tests — needs a Polygon key. Local only.
+./scripts/dbt.ps1 build                                   # 143 nodes, 1 expected WARN
+$PY -m ruff check src/ tests/ scripts/ orchestration/
 ```
+
+**`live_vendor` is a declared boundary, not an incidental skip.** Exactly one
+test file calls a vendor for real —
+[`test_split_reconciliation.py`](tests/integration/test_split_reconciliation.py),
+whose value *is* that it checks our arithmetic against Polygon's own adjusted
+close as an independent oracle. It is deselected in CI so a vendor outage can
+never turn the build red for a reason outside the diff. Recording the response
+as a fixture was rejected: a frozen copy of the oracle's answer is no longer
+independent, and could never catch a vendor restatement.
 
 A few of these are worth calling out, because a test suite that only passes is
 not evidence of much:
@@ -299,6 +369,7 @@ Written up as ADRs, with the alternatives that were rejected and why:
 | [0009](docs/adr/0009-api-design.md) | Required `price_type` enum; `as_of` resolves valid time only; one error envelope |
 | [0010](docs/adr/0010-dependency-and-runtime-pinning.md) | Stable-only dependency ranges and a pinned interpreter |
 | [0011](docs/adr/0011-ingestion-failure-policy.md) | Collect-and-continue on partial failure, then fail the run |
+| [0013](docs/adr/0013-continuous-integration-scope.md) | What CI runs; real fixtures over synthetic; no vendor calls in CI |
 
 All twelve ADRs are written; none are stubs. [0005](docs/adr/0005-prefect-for-orchestration.md)
 covers Prefect and what a dbt failure means to a flow,
@@ -342,6 +413,8 @@ src/
   ingestion/         Polygon + Yahoo adapters, FRED, security master, corporate actions, run ledger
   transforms/        Pure-Python adjusted-price reference implementation
   api/               FastAPI app: resolution, routers, response schemas
+  dashboard/         Streamlit UI — thin HTTP client, no database access
+    views/           The three pages (not `pages/`: Streamlit treats that name as magic)
 dbt/
   models/staging/       Per-source staging models
   models/intermediate/  Identity resolution, calendar checks, adjustment maths
@@ -353,8 +426,13 @@ orchestration/
   flows/             Prefect flows (daily_ingest)
 prefect.yaml         Deployment definition and cron schedule
 docs/adr/            Architecture decision records
+scripts/
+  export_ci_fixtures.py  Snapshot a live warehouse into the CI fixture set
+  load_ci_fixtures.py    Replay it through the production write path, then verify
+.github/workflows/ci.yml  Schema from empty -> fixtures -> dbt build -> tests -> lint
 tests/unit/          No network, no database
-tests/integration/   Needs the stack and a live API key
+tests/integration/   Needs the stack; `live_vendor` marks the ones that call a vendor
+tests/fixtures/ci/   The committed warehouse snapshot CI runs against
 ```
 
 Schema changes go in `migrations/`, never in `docker/postgres/init.sql` — the
@@ -373,7 +451,9 @@ archive · security master with real OpenFIGI resolution · corporate actions
 run ledger · full dbt DAG from staging through intermediate to marts, with both
 adjusted series reconciled against the Python reference and against Polygon ·
 point-in-time API over `dim_security` and `fct_security_price_daily` ·
-61 dbt data tests · 116 Python tests.
+a three-page Streamlit dashboard reading only over HTTP ·
+CI that builds the schema from empty and runs the whole suite against real data ·
+123 dbt data tests · 150 Python tests.
 
 **Not built yet:**
 
@@ -382,8 +462,16 @@ point-in-time API over `dim_security` and `fct_security_price_daily` ·
   merge layer it would plug into is finished and vendor-agnostic — adding it is
   one staging model plus one line in `int_prices_merged`'s priority `case` — so
   it is deferred rather than blocked.
-- **No CI.** `.github/workflows/` is empty.
-- **No dashboard.** Streamlit is Phase 6.
+- **The API has no endpoint that lists securities**, so the dashboard's data
+  health page iterates a configured ticker list (`DASHBOARD_TICKERS`) rather
+  than discovering the universe the way the Prefect flow does. Drift between
+  that list and the warehouse is surfaced as an error row rather than hidden — a
+  ticker that fails to resolve is shown with its reason, because a silently
+  shorter list looks like a clean warehouse.
+- **CI fixtures are a snapshot and nothing refreshes them.**
+  `scripts/export_ci_fixtures.py` regenerates them from a live warehouse in one
+  command, and refuses to run if that warehouse has lost any fact the test
+  suites depend on. Until it is re-run, CI tests against 2026-08-05 data.
 - **The Prefect worker is a process someone must keep running.** A laptop
   deployment is not high availability, and ADR-0005 says so.
 - **No auth, no rate limiting, no pagination on the API.** `/prices` caps a
@@ -417,11 +505,21 @@ point-in-time API over `dim_security` and `fct_security_price_daily` ·
   reference and against a definitional property (on the session before an
   ex-date, the total-return close equals close minus the dividend) rather than
   against a third party.
-- `assert_dividend_factors_have_a_reference_close` warns on 142 rows and is
+- `assert_dividend_factors_have_a_reference_close` warns on 138 rows and is
   *expected* to. Corporate actions are ingested from 2020 while prices cover
   weeks, so most historical dividends have no bar behind them; ADR-0003 skips
   those with no factor applied. The count should only ever shrink as price
-  history is backfilled.
+  history is backfilled — it has, from 142. Neither CI nor the Prefect flow
+  fails on a dbt `WARN`, and neither asserts the count: pinning it would turn
+  honest reporting into a brittle test, since it moves legitimately whenever the
+  ingestion window does.
+- **CI does not test the vendor adapters against the vendors.** A breaking change
+  to Polygon's response shape is caught by the nightly flow failing, not by CI.
+  That is the correct division — CI tests this repository, and a vendor changing
+  its API is not a property of a commit.
+- **The dashboard is dark-mode only.** A deliberate choice rather than an
+  oversight; its palette is validated against one surface, and contrast results
+  are only meaningful against the surface a chart actually renders on.
 
 ---
 
@@ -432,7 +530,7 @@ point-in-time API over `dim_security` and `fct_security_price_daily` ·
 3. ✅ Transform layer — dbt intermediate → marts, adjusted prices in SQL
 4. ✅ API layer — point-in-time prices endpoint → `v0.5`
 5. ✅ Completeness — Yahoo fallback, FRED macro, Prefect orchestration → `v0.7`
-6. ⬜ Polish — Streamlit dashboard, CI/CD
+6. ✅ Polish — Streamlit dashboard, CI/CD → `v0.8`
 7. ⬜ Release — docs, clean-environment test → `v1.0`
 
 ---

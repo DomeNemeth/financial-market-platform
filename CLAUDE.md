@@ -35,17 +35,27 @@ These are deliberate workarounds, not accidents. Don't "fix" them.
 ## Commands
 
 ```powershell
-docker compose up -d                                    # start stack (Postgres + API)
+docker compose up -d                                    # start stack (Postgres + API + dashboard)
+# dashboard: http://localhost:8501   API: http://localhost:8000
 .venv\Scripts\python.exe -m src.common.migrate          # apply pending schema migrations
 .venv\Scripts\python.exe -m src.common.migrate --status # show migration state
 
-.venv\Scripts\python.exe -m pytest -m "not integration" # 37 unit tests, no network/DB
-.venv\Scripts\python.exe -m pytest tests/integration -q # 79 tests, needs stack + API key
+.venv\Scripts\python.exe -m pytest -m "not integration" # 57 unit tests, no network/DB
+.venv\Scripts\python.exe -m pytest tests/integration -m "not live_vendor" -q   # 80 tests, no vendor calls
+.venv\Scripts\python.exe -m pytest tests/integration -m live_vendor -q         # 13 tests, needs POLYGON_API_KEY
 
-.venv\Scripts\python.exe -m ruff check src/ tests/ scripts/
+.venv\Scripts\python.exe -m ruff check src/ tests/ scripts/ orchestration/
 
 .\scripts\dbt.ps1 debug                                 # verify dbt connection
-.\scripts\dbt.ps1 build                                 # seed + snapshot + run + test (71 nodes, 1 expected WARN)
+.\scripts\dbt.ps1 build                                 # seed + snapshot + run + test (143 nodes, 1 expected WARN)
+
+# CI fixtures — export from a populated warehouse, load into an empty one
+.venv\Scripts\python.exe -m scripts.export_ci_fixtures  # refresh tests/fixtures/ci/*.csv
+.venv\Scripts\python.exe -m scripts.load_ci_fixtures    # load + verify invariants
+.venv\Scripts\python.exe -m scripts.load_ci_fixtures --verify   # verify only
+
+# dashboard, outside Docker
+.venv\Scripts\python.exe -m streamlit run src/dashboard/app.py  # needs the API on :8000
 
 # ingestion
 .venv\Scripts\python.exe -m src.ingestion --tickers AAPL MSFT --start 2026-06-01 --end 2026-06-30
@@ -70,39 +80,54 @@ curl 'http://localhost:8000/securities/KLAC'
 curl 'http://localhost:8000/prices/KLAC?price_type=split_adjusted&start=2026-06-11&end=2026-06-12'
 curl 'http://localhost:8000/prices/JPM?price_type=total_return_adjusted&start=2026-07-02&end=2026-07-06'
 curl 'http://localhost:8000/pipeline/runs?limit=5'
+curl 'http://localhost:8000/corporate-actions/KLAC?start=2026-05-01&end=2026-08-03'
 # interactive docs: http://localhost:8000/docs
 ```
 
 ---
 
-## Where we are — Phase 5 of 7, complete
+## Where we are — Phase 6 of 7, complete
 
-**Phases 1–4 are complete (tagged `v0.2`, `v0.3`, `v0.5`). Phase 5 is complete and tagged `v0.7`.** Phase 6 (Streamlit dashboard, CI/CD) is next.
+**Phases 1–5 are complete (tagged `v0.2`, `v0.3`, `v0.5`, `v0.7`). Phase 6 is complete and tagged `v0.8`.** Phase 7 (release docs, clean-environment test, `v1.0`) is next.
 
-All three Phase 5 additions are in:
+All Phase 6 items are in:
 
-| Phase 5 item | Status |
+| Phase 6 item | Status |
 |---|---|
-| Yahoo fallback adapter + ADR-0006 merge layer | ✅ done, verified |
-| FRED macro data + point-in-time ASOF join | ✅ done, verified |
-| Prefect orchestration (ADR-0005, `daily_ingest` flow) | ✅ done, verified through a real worker |
+| ADR-0013 — what CI runs and what it deliberately does not | ✅ written |
+| CI fixtures: real warehouse snapshot, loaded through `upsert_dataframe()` | ✅ done |
+| `.github/workflows/ci.yml` — schema from empty → fixtures → dbt → tests → lint | ✅ done, **whole chain simulated locally against an empty Postgres** |
+| `live_vendor` marker; integration tests made CI-portable | ✅ done |
+| `ci` dbt target | ✅ done |
+| `GET /corporate-actions/{ticker}` | ✅ done, 11 tests, mutation-verified |
+| Three-page Streamlit dashboard, thin HTTP client | ✅ done |
+| `dashboard` service in `docker-compose.yml` | ✅ done |
+| Branch protection + a deliberate-break PR | ⬜ **needs the repo owner** — see below |
 
-Everything below was verified against real data and a live database on 2026-08-04, not against fixtures.
+Verified on 2026-08-05, against real data and a live database, not against mocks:
 
 | Check | Status |
 |---|---|
 | `ruff check src/ tests/ scripts/ orchestration/` | ✅ clean |
-| `pytest -m "not integration"` | ✅ 57 passed (was 37) |
-| `pytest tests/integration` | ✅ 82 passed (was 79) |
+| `pytest -m "not integration"` | ✅ 57 passed |
+| `pytest tests/integration -m "not live_vendor"` | ✅ 80 passed, 13 deselected, **0 skipped** |
 | `dbt build` | ✅ 143 nodes, PASS=142 WARN=1 ERROR=0 |
-| Migrations | ✅ 0001–0006 applied |
-| Price data | ✅ 6 tickers, 2026-05-01 → 2026-08-03: 276 Polygon bars + 120 Yahoo fallback bars |
-| Macro data | ✅ 10 FRED series, ~49k observations, `.` sentinels → NULL |
-| Prefect | ✅ deployment registered, cron schedule active, **executed end-to-end by a real worker** |
-| `/health` | ✅ `{"status":"ok","db":"connected"}` |
-| API spot-checks | ✅ curl across the fallback/primary boundary — Yahoo bars serve `vwap: null` honestly |
+| **CI chain against an EMPTY Postgres** | ✅ init.sql → migrations 0001–0006 → fixtures → `dbt build` PASS=142 WARN=1 → integration 69 passed → unit 57 passed |
+| CI fixtures | ✅ 3,891 rows / 322 KB across 6 CSVs; load is idempotent; `verify()` passes |
+| Dashboard error paths | ✅ 404, 409 (with both candidates), 400, and API-unreachable all exercised against the real API |
 
-The one WARN is `assert_dividend_factors_have_a_reference_close`, now at **138 rows, down from 142**. That drop is the prediction in this file coming true: the count "should only shrink as history is backfilled", and the Yahoo May backfill gave four more dividends a reference close. A build with zero warnings would mean that test had been silently weakened.
+**0 skipped in the integration run is the number that matters.** Several tests `pytest.skip` themselves when their data is absent, so a fixture that failed to load would leave CI green and hollow. `load_ci_fixtures.py` re-verifies its invariants after loading precisely so that failure is loud and upstream.
+
+**The dashboard's thin-client claim is enforced by the container, not by convention.** The `dashboard` compose service deliberately omits `env_file: .env`, so it has no `POSTGRES_*` and no API key. Verified: inside the running container `import src.common.database` fails with `4 validation errors for Settings`, while `api_client.get_prices('KLAC', ...)` returns 64 bars over HTTP from `http://app:8000`. A future refactor cannot quietly open a database connection from the UI because there is nothing to connect with.
+
+The one WARN is `assert_dividend_factors_have_a_reference_close` at **138 rows, down from 142**. Neither CI nor the flow fails on a `WARN`, and neither asserts the count — it moves legitimately whenever the ingestion window moves, so pinning it would convert honest reporting into a brittle test.
+
+### Still outstanding — needs the repo owner
+
+The repository is now public. Two Phase 6 items cannot be done from here because `gh` is not installed on this machine and branch protection is a GitHub-side setting:
+
+1. **Turn on branch protection** for `main`: require a PR, require the status check named **`ci`**, require branches to be up to date. The job id in `ci.yml` is `ci`; **renaming that job silently disables the protection rule**, because a required check that never reports is simply never waited for.
+2. **Prove CI is real** by breaking something deliberately in a PR, watching it go red, then reverting. The sharpest break is not a syntax error — it is deleting the `DISTINCT ON` from `upsert_dataframe()`, or flipping `f.ex_date <= b.trading_date` to `<` in `int_prices_with_adjustments`. Both are silent in production and both should turn CI red.
 
 ### What Phase 2 added
 
@@ -235,15 +260,40 @@ stg_yahoo__prices   ─┴→ int_prices_with_calendar   (+source in the grain)
 - **Two ledger honesty bugs, both caught by reading the numbers rather than assuming them.** The parent row reported `rows=36` for a run whose FRED child had committed 36,245 — because `results` only holds return values of tasks that *completed*, and ADR-0011 guarantees a failed task still committed its successes. It now sums the child rows. And `dbt_build` was recording `rows_ingested=143`, a node count in a row-count field, which would have made `sum(rows_ingested)` add dbt nodes to a count of price bars. It records 0.
 - **The integration suite caught a break I introduced and would have hidden a worse one.** Moving `RATE_LIMIT_SLEEP` onto the adapter broke a monkeypatch with a loud `AttributeError` — which masked the real problem: the CLI now resolves adapters through the `ADAPTERS` registry, so patching the module-level `PolygonAdapter` name no longer affects it, and those six tests would have made **real network calls** for tickers that do not exist.
 
-### Known issues
+### What Phase 6 added
 
-- **No CI.** `.github/workflows/` is an empty directory. CLAUDE.md previously implied CI existed ("CI needs no wrapper"); it does not.
+**CI that would actually catch something** (ADR-0013). `init.sql` → migrations from empty → fixtures → `dbt build` → integration tests → unit tests → ruff, on a Postgres service container. The order is the dependency order.
+
+**The fixtures are a real warehouse snapshot, not synthetic data**, and that is the decision the whole of CI rests on. This project's assertions are mostly about *data*: `assert_deadjusted_yahoo_reconciles_to_polygon_raw` needs KLAC's nine pre-split overlap sessions or its non-vacuity guard fires; `assert_point_in_time_macro_differs_from_naive` needs observations whose publication date falls after the price window; `test_total_return_reconciliation` calls `pytest.skip` outright on an empty warehouse. A CI run against an empty database would have been green, fast, and meaningless. Fabricated fixtures would have been chosen to make the tests pass, which inverts the relationship the tests exist to have with the data.
+
+**Macro observations are the one thing subset** — `observation_date >= 2023-01-01`, 3,073 rows instead of 49,335. Verified to preserve GDP's full 175-day maximum publication lag, a first release before the price window opens for every point-in-time-capable series, and the **18 observations a naive `observation_date` join would leak**. The three series with no publication history (`DGS10`, `DGS2`, `T10Y2Y`) are kept, not dropped — their absence is the entire point of `supports_point_in_time_join`.
+
+**Fixtures load through `upsert_dataframe()`**, the production write path, never through `COPY`. A faster loader would have been a second, more permissive route into `raw` that CI exercises on every run and production never does. Loading this way also makes the script a smoke test of the idempotency guarantee.
+
+**`GET /corporate-actions/{ticker}`**, to support chart annotations. It reads `intermediate.int_corporate_actions__factors` rather than a mart, because a mart there would have been `select *` over that view — the model already *is* the answer to the question. It resolves through the same `resolve_security` as `/prices`, so overlaying the two responses is sound rather than coincidental. No `MAX_BARS`-style cap: actions are events, not observations, and a silently truncated annotation set is worse than a truncated series — a missing split leaves a chart looking like a −90% crash with nothing marking it.
+
+**A three-page Streamlit dashboard**, narrowed from five. Thin HTTP client, no database credentials. Dark-only, with its palette taken verbatim from a pre-validated set at the surface it was validated against, because colourblind-safety is computed rather than judged and the tool that computes it was not available on this machine.
+
+### Things that earned their keep
+
+- **CI's first real job was catching a lie in a docstring.** `test_security_master_scd2.py` hard-coded `.venv/Scripts/dbt.exe` directly beneath a docstring claiming the test was "runnable on any platform". Nothing noticed for three phases because nothing ever ran the suite anywhere but this Windows machine.
+- **The fixture exporter shipped a float bug on its first run, and the loud half is the lucky half.** `pandas.read_sql` infers a nullable BIGINT as float64 (NaN is the only null float64 has), so `trade_count` was written as `904768.0` and Postgres rejected it: `invalid input syntax for type integer`. The same inference one column to the left is *silently accepted* — `volume` and every price are NUMERIC, so a float64 round-trip would have loaded cleanly having quietly discarded digits, and then failed the split reconciliation at 1e-9 with nothing pointing at the cause. Fixed by casting every column `::text` in SQL, so Postgres does the conversion and pandas only ever sees `str` and `None`.
+- **`0 skipped` is the assertion, not `80 passed`.** Several integration tests skip themselves when their data is absent, so a broken fixture load would leave a green CI. `load_ci_fixtures.py` re-verifies its invariants after loading — the KLAC split, the JPM holiday dividend, the nine Yahoo overlap bars, the DGS10 sentinel NULL, the 175-day GDP lag — so that failure is loud and happens upstream of the tests it would have disarmed.
+- **The corporate-actions point-in-time test was proven by mutation.** Re-keying the query from `security_id` to a ticker subquery fails exactly one of its 11 tests — the ticker-reuse one — and leaves the other ten green, which is correct: they concern a single never-reused security.
+- **The dashboard's thin-client rule is enforced by an absent environment**, not by review. `import src.common.database` fails inside the container.
+
+### Known issues
 - **The Prefect worker is a process someone has to keep running.** A laptop deployment is not high availability, and ADR-0005 says so rather than implying otherwise. A missed run is repaired by the next one — the flow uses a trailing 5-day window and loads are idempotent — but only if something restarts the worker.
 - **Prefect's own telemetry fails on this machine.** `Failed to send telemetry: CERTIFICATE_VERIFY_FAILED` in the server log. Avast MITMs TLS and Prefect's telemetry client does not use `truststore` the way `src/common/tls.py` does. Cosmetic — it is telemetry — but it is noise in every server log and it is not a project bug.
 - **FRED is re-fetched in full every night** (~49k observations). Idempotent and correct, since a revision can touch any period, but wasteful. ADR-0005 accepted it to keep one flow and one schedule.
 - **Macro `value` is the latest revision, not the value as first published** (ADR-0012). The point-in-time join removes look-ahead about a number's *existence*, not about its *value* — the same boundary ADR-0009 draws for `as_of`. `macro_vintage_date` is carried per row so a consumer sees which revision they hold. Full replay needs every vintage stored; Phase 6.
 - **Yahoo's `adjclose` is fetched and discarded.** A third adjusted series with a methodology this project has not audited. ADR-0003 is explicit that a series called `adjusted_close` with unstated semantics is the thing the design exists to avoid.
 - **Yahoo's chart endpoint is unofficial and unauthenticated.** No SLA, no published rate limit, and it rejects default `requests` User-Agents with a spurious 429. Acceptable for a fallback; it would not be acceptable for a primary.
+- **CI fixtures are a 2026-08-05 snapshot and nothing refreshes them.** `scripts/export_ci_fixtures.py` regenerates them in one command and refuses to run against a warehouse that has lost any invariant the suites depend on. Until it is re-run, CI tests against that day's data. Staleness is visible rather than silent — the fixtures carry fixed dates and the tests assert against those dates.
+- **CI does not test the adapters against the vendors.** A breaking change to Polygon's response shape is caught by the nightly flow failing, not by CI. Correct division: CI tests this repository; a vendor changing its API is not a property of a commit.
+- **~250 KB of real vendor rows are committed to the repo.** FRED is US government data and unrestricted, corporate actions are public record, and the OHLCV extract is small, historical, and non-substitutive for a subscription. Judged acceptable and recorded in ADR-0013 rather than left implicit, so a future decision to grow the fixture is made with the question in view.
+- **The API has no endpoint that lists securities**, so the dashboard's data-health page iterates a configured `DASHBOARD_TICKERS` list rather than discovering the universe the way `tracked_tickers()` does. Drift is surfaced as an error row, not hidden.
+- **The dashboard is dark-mode only** and its CSS, though pinned to `data-testid` selectors rather than generated class names, is still coupled to Streamlit's DOM. A Streamlit upgrade degrades the polish rather than breaking the page.
 - The provisional→FIGI merge edge case (two identities resolving to one FIGI) is **detected but not repaired** — see ADR-0004. Deliberate.
 - Polygon's free tier caps aggregates at **2 years**; requests for older bars 403. Reference endpoints (splits, dividends, ticker details) are not capped. This is why the split reconciliation uses KLAC 2026 rather than NVDA 2024.
 - `exchange_calendars` only generates ~1 year forward; the seed is clamped to 2027-08-02 and must be regenerated periodically.
@@ -255,7 +305,7 @@ stg_yahoo__prices   ─┴→ int_prices_with_calendar   (+source in the grain)
 
 ## Architecture decisions — do not silently revise
 
-Full rationale in `docs/adr/`. **All twelve ADRs are written** — 0001–0012, including ADR-0003's SQL addendum. There are no stubs left.
+Full rationale in `docs/adr/`. **All thirteen ADRs are written** — 0001–0013, including ADR-0003's SQL addendum. There are no stubs left.
 
 - **Postgres is the transform substrate** (ADR-0001). Python ingestion writes Parquet as an immutable archive **and** loads the same rows into `raw`. dbt runs entirely against Postgres. DuckDB is deliberately **not** in the critical path.
 - **Parquet is written before Postgres** (ADR-0002), so a crash leaves an archived file with no row — recoverable — rather than a row with no provenance.
@@ -286,6 +336,13 @@ Full rationale in `docs/adr/`. **All twelve ADRs are written** — 0001–0012, 
 - **The API is sync SQLAlchemy on purpose** (ADR-0009). One engine, one idiom, shared with ingestion. The revisit trigger is measured pool-checkout queuing, not taste.
 - **dbt and Python are pinned to stable ranges** (ADR-0010). Not upgradeable casually — read that ADR first.
 - **`docker-compose.yml` belongs at repo root.** `docker/` holds *inputs* to compose.
+- **CI never calls a vendor API** (ADR-0013). Not a cost decision — a determinism one. A CI signal that goes red for reasons outside the diff is a signal people learn to ignore. `live_vendor` is a declared marker, not an incidental `skipif`.
+- **CI fixtures are real, and are loaded through `upsert_dataframe()`** (ADR-0013). Never `COPY`, never a second write path. Do not "simplify" the loader.
+- **CI uses `dbt build`'s exit code; the Prefect flow parses `run_results.json`.** Both implement ADR-0005's rule and the difference is deliberate — the flow must *record* a status and tell a warning from a dbt that died before writing the artifact; CI records nothing and a dead dbt exits non-zero anyway. Do not add the parser to CI, and do not reduce the flow to an exit code.
+- **The dashboard never touches the database.** No `POSTGRES_*` in its compose environment and no SQLAlchemy import. A UI with its own query is a second implementation of ticker resolution, which is the bare-ticker join ADR-0009 exists to prevent, at the one layer a human looks at.
+- **The dashboard palette is copied from a validated set, not chosen.** Colourblind-safety is computed. If the surface changes, the palette must be re-validated against the new one — contrast results are only meaningful against the surface a chart actually renders on.
+- **Never a dual-axis chart.** Price and volume are two stacked panels sharing one x-axis. Twin y-scales invent a correlation that is not in the data, because the alignment between them is arbitrary.
+- **The CI job id is `ci`.** Branch protection requires a check by that name; renaming the job silently disables the rule, because a required check that never reports is never waited for.
 
 ---
 
@@ -318,7 +375,7 @@ Full rationale in `docs/adr/`. **All twelve ADRs are written** — 0001–0012, 
 3. ✅ **Transform layer** — dbt intermediate → marts, adjusted prices in SQL → tagged `v0.3`
 4. ✅ **API layer** — FastAPI + point-in-time prices endpoint → tagged `v0.5`
 5. ✅ **Completeness** — Yahoo fallback, FRED macro, Prefect orchestration → tagged `v0.7`
-6. Polish — Streamlit dashboard, CI/CD ← *next*
-7. Release — docs, ADRs, clean-environment test → tag `v1.0`
+6. ✅ **Polish** — Streamlit dashboard, CI/CD → tagged `v0.8`
+7. Release — docs, ADRs, clean-environment test → tag `v1.0` ← *next*
 
 Realistic timeline: 10–14 weeks part-time.

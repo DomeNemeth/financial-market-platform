@@ -51,3 +51,37 @@ services:
       --host 0.0.0.0
       --port 8000
       --reload
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    environment:
+      # The dashboard's ONLY connection to data. It has no POSTGRES_* variables
+      # here and that is the point: it holds no database credentials, so there
+      # is exactly one implementation of "which security is this ticker" and the
+      # UI cannot go around it. See src/dashboard/api_client.py.
+      #
+      # `app`, not localhost — containers reach each other by service name, the
+      # same reason the app service overrides POSTGRES_HOST above.
+      API_BASE_URL: http://app:8000
+      # Deliberately NOT env_file: .env. Loading it would hand this container
+      # POSTGRES_PASSWORD and POLYGON_API_KEY for no reason; a thin client that
+      # is given credentials it does not need is one refactor away from using
+      # them.
+      DASHBOARD_TICKERS: AAPL,JPM,KLAC,MSFT,NVDA,V
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./src:/app/src
+      - ./.streamlit:/app/.streamlit
+    depends_on:
+      # Waits for the container, not for readiness — the API has no healthcheck.
+      # Harmless here: every page renders its own "API not reachable" state
+      # rather than crashing, so a dashboard that starts first shows that panel
+      # and recovers on the next rerun.
+      - app
+    command: >
+      streamlit run src/dashboard/app.py
+      --server.address 0.0.0.0
+      --server.port 8501

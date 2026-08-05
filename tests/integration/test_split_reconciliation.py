@@ -56,8 +56,20 @@ from src.common.tls import enable_system_trust_store
 from src.ingestion.adapters.polygon import PolygonAdapter
 from src.transforms.adjusted_prices import Bar, Split, adjust_bars
 
+# `live_vendor` because leg 2 and leg 3 below call Polygon's aggregates endpoint
+# for real. That is not incidental to this file — it is the point of it. The
+# external-oracle legs are what distinguish "our two implementations agree" from
+# "our two implementations are both right", and a recorded response would make
+# them our own assertion with extra steps, incapable of ever catching a vendor
+# restatement. So the test keeps its live call and is deselected in CI instead.
+# ADR-0013 records why that trade was made in this direction.
+#
+# The skipif stays as well: it is what keeps a keyless local run honest, and it
+# answers a different question (is a key available) from the marker (should this
+# ever run unattended).
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.live_vendor,
     pytest.mark.skipif(not settings.polygon_api_key, reason="POLYGON_API_KEY not set"),
 ]
 
