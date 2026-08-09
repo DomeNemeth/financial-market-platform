@@ -130,7 +130,7 @@ bar_running_totals as (
     from bars b
     left join factors f
         on  f.security_id = b.security_id
-        and f.ex_date    <= b.trading_date
+        and f.ex_date    < b.trading_date
 
     group by 1, 2
 
