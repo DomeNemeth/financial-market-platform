@@ -24,9 +24,17 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # The job id is the name branch protection requires. Renaming it silently
-  # disables the protection rule, because a required check that never reports is
-  # simply never waited for. Don't.
+  # This job id is the name branch protection requires, and it is load-bearing.
+  #
+  # GitHub names a check run after the job's `name:` when one is set, and falls
+  # back to the job id only when it is absent. So this job deliberately has NO
+  # `name:` — adding one, or renaming the id, changes the reported check name
+  # and the required check `ci` then never reports at all.
+  #
+  # That does not quietly disable the rule; it is worse. A required check with
+  # no status leaves every PR pinned at "Expected — waiting for status to be
+  # reported" and unmergeable, with nothing in the log to explain why. Measured
+  # on PR #2: `mergeable=MERGEABLE mergeStateStatus=BLOCKED`. Don't.
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 20

@@ -1,0 +1,43 @@
+{
+  "_comment": [
+    "The branch protection rule enforced on `main`, recorded so a clone can see it.",
+    "",
+    "GitHub holds the authoritative copy server-side and NOTHING syncs this file:",
+    "editing it changes no rule, and changing the rule in the UI does not update it.",
+    "It exists so the protection is auditable from the repository and so a change to",
+    "it is reviewed rather than clicked. Apply with:",
+    "",
+    "  gh api repos/:owner/:repo/branches/main/protection -X PUT --input .github/branch-protection.json",
+    "",
+    "`contexts: [ci]` must match the job id in workflows/ci.yml, which deliberately",
+    "has no `name:` — GitHub names a check run after the job's `name:` when one is",
+    "set. A required check that never reports does not disable the rule; it pins",
+    "every PR at Expected and blocks the merge.",
+    "",
+    "`enforce_admins: true` is the point of the exercise. Without it the repo owner",
+    "keeps an implicit bypass, the merge button stays green on a failing PR, and the",
+    "rule protects nobody who could actually break `main`.",
+    "",
+    "`required_approving_review_count: 0` because this is a single-author repository.",
+    "Requiring an approval would lock the only author out of their own main branch;",
+    "the PR itself is the gate here, and the status check is what has teeth.",
+    "",
+    "GitHub ignores unknown keys, so this comment is inert on PUT."
+  ],
+
+  "required_status_checks": {
+    "strict": true,
+    "contexts": ["ci"]
+  },
+  "enforce_admins": true,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 0,
+    "dismiss_stale_reviews": false,
+    "require_code_owner_reviews": false
+  },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false,
+  "required_conversation_resolution": false,
+  "required_linear_history": false
+}
