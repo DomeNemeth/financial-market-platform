@@ -1,0 +1,7 @@
+security_id,ticker,name,figi,share_class_figi,cusip,isin,exchange,currency,security_type,active,list_date,delist_date,source,ingested_at
+1,NVDA,Nvidia Corp,BBG000BBJQV0,BBG001S5TZJ6,,,XNAS,USD,CS,true,1999-01-22,,polygon,2026-08-01 23:10:24.465107+00
+2,AAPL,Apple Inc.,BBG000B9XRY4,BBG001S5N8V8,,,XNAS,USD,CS,true,1980-12-12,,polygon,2026-08-01 23:10:24.471526+00
+3,KLAC,KLA Corporation Common Stock,BBG000BMTFR4,BBG001S5SLM4,,,XNAS,USD,CS,true,1980-10-08,,polygon,2026-08-01 23:33:32.557608+00
+32,JPM,JPMorgan Chase & Co.,BBG000DMBXR2,BBG001S8CRC3,,,XNYS,USD,CS,true,1969-03-05,,polygon,2026-08-02 15:12:28.766395+00
+33,MSFT,Microsoft Corp,BBG000BPH459,BBG001S5TD05,,,XNAS,USD,CS,true,1986-03-13,,polygon,2026-08-02 15:12:28.766395+00
+34,V,VISA Inc.,BBG000PSKYX7,BBG001SRCFY3,,,XNYS,USD,CS,true,2008-03-19,,polygon,2026-08-02 15:12:28.782447+00

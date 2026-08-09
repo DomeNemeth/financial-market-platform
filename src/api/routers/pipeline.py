@@ -57,7 +57,15 @@ def list_runs(
             text("""
                 SELECT
                     id, flow_name, status, started_at, completed_at,
-                    rows_ingested, error_message, metadata, created_at
+                    rows_ingested, error_message, metadata, created_at,
+                    -- Added in Phase 6 for the dashboard's pipeline page. This
+                    -- is exactly the change the module docstring anticipates:
+                    -- the endpoint's value is showing whatever the ledger
+                    -- recorded, "including columns added since any schema was
+                    -- written", and nothing may build against its shape. NULL
+                    -- for CLI runs; set for the per-step children a Prefect
+                    -- flow run writes (migration 0006).
+                    parent_run_id
                 FROM public.pipeline_runs
                 WHERE (CAST(:status AS text) IS NULL
                        OR upper(status) = upper(CAST(:status AS text)))

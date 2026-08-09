@@ -1,0 +1,30 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# psycopg2 needs these to build, and it arrives as a transitive dependency of the
+# project even though THIS image never opens a database connection. The dashboard
+# is a thin HTTP client by design (src/dashboard/api_client.py): it holds no
+# credentials and imports no SQLAlchemy. Splitting the dependency set so the
+# driver could be excluded here would mean maintaining a second install profile
+# for one library — a worse trade than an unused wheel.
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+
+RUN pip install --no-cache-dir .
+
+# Streamlit reads .streamlit/config.toml relative to the working directory. The
+# dark theme lives there rather than in injected CSS, so it has to be in the
+# image — without it the container renders in Streamlit's default light theme
+# while a local run is dark, which is the kind of difference nobody notices
+# until a screenshot.
+COPY .streamlit/ ./.streamlit/
+
+ENV PYTHONPATH=/app
+
+EXPOSE 8501

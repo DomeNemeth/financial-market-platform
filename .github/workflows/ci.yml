@@ -1,0 +1,175 @@
+# Continuous integration.
+#
+# Scope, and the reasoning behind it, is ADR-0013. The short version: this
+# workflow builds the schema from empty, loads a real (not synthetic) warehouse
+# fixture, and then runs the dbt suite and the integration suite against it —
+# because most of this project's assertions are about DATA, and a CI run against
+# an empty database would be green, fast, and meaningless.
+#
+# Nothing here calls a vendor API. See the `live_vendor` marker in pyproject.toml.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first. `main` is excluded from
+# cancellation via the ref in the group key so a merge to main always completes
+# and always leaves a badge state that reflects main rather than an aborted run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # The job id is the name branch protection requires. Renaming it silently
+  # disables the protection rule, because a required check that never reports is
+  # simply never waited for. Don't.
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        # Pinned to the same major the project runs locally. dbt's Postgres
+        # adapter is version-sensitive in exactly the places this project leans
+        # on — numeric behaviour and the planner's treatment of the valid-time
+        # inequality join that ADR-0008 had to materialise around.
+        image: postgres:16
+        env:
+          POSTGRES_DB: market_data
+          POSTGRES_USER: market_user
+          POSTGRES_PASSWORD: ci_password
+        ports:
+          # 5432, not the 5433 used locally. The 5433 mapping exists only to
+          # dodge a native PostgreSQL 18 service on one Windows machine; a
+          # runner has no such conflict. The `ci` dbt target defaults to 5432
+          # for the same reason.
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U market_user -d market_data"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: market_data
+      POSTGRES_USER: market_user
+      POSTGRES_PASSWORD: ci_password
+
+      # Settings requires this field and gives it no default, so every entrypoint
+      # — including pytest collection — fails at import without it. It is a
+      # placeholder: no step in this workflow calls Polygon, and the one test
+      # that would is deselected by `-m "not live_vendor"`. A real key must never
+      # be added here; that would make CI's behaviour depend on a vendor's uptime,
+      # which ADR-0013 rejects.
+      POLYGON_API_KEY: ci-placeholder-never-used
+      FRED_API_KEY: ""
+
+      APP_ENV: ci
+      LOG_LEVEL: INFO
+
+      # The dbt profile output selected by every dbt invocation below, including
+      # the one test_security_master_scd2.py shells out to.
+      DBT_TARGET: ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # ADR-0010: 3.11 is not a preference. Stable dbt-core 1.11 pins
+          # mashumaro<3.15, and mashumaro 3.14 fails at import on 3.14.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # ---------------------------------------------------------------- schema
+
+      - name: Bootstrap the database (init.sql)
+        # init.sql only ever executes on an EMPTY data directory, so on a
+        # developer machine it has not run since Phase 1 and a change to it
+        # would go unnoticed until the next clone. Applying it explicitly here
+        # is the only place it is exercised. It is bootstrap-only — extensions
+        # and schemas — because ADR/convention puts every schema change in
+        # migrations/.
+        run: psql "$DSN" -v ON_ERROR_STOP=1 -f docker/postgres/init.sql
+        env:
+          DSN: postgresql://market_user:ci_password@localhost:5432/market_data
+
+      - name: Apply migrations from empty
+        run: python -m src.common.migrate
+
+      - name: Show migration state
+        # Cheap, and it puts the applied set and its checksums in the log, so a
+        # checksum rejection later is diagnosable from the run alone.
+        run: python -m src.common.migrate --status
+
+      # -------------------------------------------------------------- fixtures
+
+      - name: Load CI warehouse fixtures
+        # Loads through upsert_dataframe() — the production write path — and
+        # then re-verifies the invariants the test suites depend on. This is the
+        # guard that stops CI going green on a hollow database: several tests
+        # pytest.skip themselves when their data is absent, so a failed fixture
+        # load would otherwise look like a pass.
+        run: python -m scripts.load_ci_fixtures
+
+      # ------------------------------------------------------------------- dbt
+
+      - name: Configure dbt profile
+        # The repo keeps ~/.dbt/profiles.yml verbatim identical to the committed
+        # example, so CI does the same rather than generating its own — a
+        # generated profile could drift from the one developers use and make CI
+        # test a connection shape that exists nowhere else.
+        run: |
+          mkdir -p ~/.dbt
+          cp dbt/profiles.yml.example ~/.dbt/profiles.yml
+
+      - name: dbt debug
+        run: dbt debug --project-dir dbt --target ci
+
+      - name: dbt build
+        # No --fail-fast: a full run reports every failing model and test in one
+        # log, which is what makes a red CI actionable rather than iterative.
+        #
+        # The exit code is used directly, unlike the Prefect flow, which parses
+        # run_results.json. That difference is deliberate and ADR-0013 explains
+        # it: dbt already exits non-zero on FAIL/ERROR and zero on WARN, which is
+        # exactly the rule ADR-0005 wants. The flow needs the artifact because it
+        # must RECORD a status and must tell "dbt warned" from "dbt died before
+        # starting"; CI records nothing, and a dbt that dies exits non-zero.
+        #
+        # assert_dividend_factors_have_a_reference_close warns on purpose and its
+        # row count is deliberately NOT asserted — it moves legitimately whenever
+        # the fixture window moves.
+        run: dbt build --project-dir dbt --target ci
+
+      # ----------------------------------------------------------------- tests
+
+      - name: Integration tests
+        # -m "not live_vendor" is the declared CI/local boundary, not an
+        # incidental consequence of POLYGON_API_KEY being a placeholder.
+        run: pytest tests/integration -m "not live_vendor" -q
+
+      - name: Unit tests
+        # Must pass with no database at all. Running them after the DB-dependent
+        # steps rather than before is intentional: it costs nothing, and the
+        # expensive signal should arrive first.
+        run: pytest -m "not integration" -q
+
+      # ------------------------------------------------------------------ lint
+
+      - name: Lint
+        # Last on purpose. A formatting nit aborting the job early would hide a
+        # real dbt or test failure behind a trailing whitespace error.
+        run: ruff check src/ tests/ scripts/ orchestration/

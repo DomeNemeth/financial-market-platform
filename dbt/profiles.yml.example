@@ -1,10 +1,39 @@
 financial_market_platform:
   target: dev
   outputs:
+
+    # Local development. Host-side values: Postgres is published on 5433 because
+    # a native Windows PostgreSQL 18 service owns 5432 on the author's machine.
     dev:
       type: postgres
       host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
       port: "{{ env_var('POSTGRES_PORT', '5433') | int }}"
+      user: "{{ env_var('POSTGRES_USER') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD') }}"
+      dbname: "{{ env_var('POSTGRES_DB') }}"
+      schema: staging
+      threads: 4
+
+    # GitHub Actions, against the workflow's `postgres` service container.
+    #
+    # The defaults differ from dev in exactly one place that matters: port 5432,
+    # not 5433. The 5433 mapping exists solely to dodge a conflict on one
+    # Windows machine; a Linux runner has no such conflict and a service
+    # container is reached on its native port. Inheriting dev's default here
+    # would fail with "connection refused" pointing at a port nothing is
+    # listening on, which is a confusing way to learn that.
+    #
+    # Every var is still read from the environment rather than hard-coded, so
+    # this target has no credentials in it and CI stays free to change them.
+    #
+    # threads: 4 is kept deliberately. GitHub's standard runners have 4 cores,
+    # and lowering it would make CI's dbt run a different shape from the one
+    # developers see — including different interleaving of the tests, which is
+    # where an accidental dependency between models would surface.
+    ci:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
+      port: "{{ env_var('POSTGRES_PORT', '5432') | int }}"
       user: "{{ env_var('POSTGRES_USER') }}"
       password: "{{ env_var('POSTGRES_PASSWORD') }}"
       dbname: "{{ env_var('POSTGRES_DB') }}"

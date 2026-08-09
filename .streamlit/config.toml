@@ -1,0 +1,33 @@
+# Streamlit theming.
+#
+# The bulk of the dashboard's look lives HERE rather than in injected CSS,
+# deliberately. Streamlit generates its own class names and changes them between
+# releases, so a stylesheet built on them breaks silently on upgrade. This file
+# is a supported configuration surface; src/dashboard/theme.py carries only the
+# handful of rules this cannot express, pinned to stable `data-testid` selectors.
+#
+# The colours are the dark steps of a pre-validated palette, at the surface it
+# was validated against. See the module docstring of src/dashboard/theme.py for
+# why they are not adjusted to taste.
+
+[theme]
+base = "dark"
+
+# Page plane, one step below the chart surface — which is what gives a dark
+# layout depth without drawing a box around everything.
+backgroundColor = "#0d0d0d"
+secondaryBackgroundColor = "#1a1a19"
+
+textColor = "#ffffff"
+
+# Categorical slot 1. Used for interactive accents (focus rings, selected
+# controls) as well as the price series, so the accent and the data agree.
+primaryColor = "#3987e5"
+
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
