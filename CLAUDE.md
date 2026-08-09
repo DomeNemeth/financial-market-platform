@@ -1,6 +1,6 @@
 # Financial Market Platform
 
-Multi-source financial market data ingestion, warehousing, and API. Portfolio project #1 of a 25-project curriculum; the author is a GTM Engineer moving toward Data/AI Engineering. **Portfolio quality is the goal** — favour rigour, honest documentation, and decisions that can be defended in an interview over speed.
+Multi-source financial market data ingestion, warehousing, and API. **Portfolio quality is the goal** — favour rigour, honest documentation, and decisions that can be defended over speed.
 
 Python 3.11 · FastAPI · SQLAlchemy · Postgres 16 · dbt-postgres 1.11 · Docker Compose · pytest · Polygon.io · Yahoo Finance · FRED · OpenFIGI
 
