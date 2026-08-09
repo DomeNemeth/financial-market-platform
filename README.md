@@ -19,11 +19,12 @@ Three concrete examples, all of which this project handles explicitly:
 | **Corporate actions** | NVDA closed at \$1,208.88 on 2024-06-07 and ~\$120 the next session after a 10:1 split | A −90% return that never happened |
 | **Vendors restate** | Today's reference data gets applied to yesterday's prices | Look-ahead bias — the number looks fine and is wrong |
 
-> **Status: Phase 6 of 7.** Ingestion from three vendors, reference data, the
-> dbt transform layer, the point-in-time API, nightly Prefect orchestration, a
-> Streamlit dashboard, and CI are complete and tested against live vendor data.
-> Remaining: release documentation and a clean-environment test.
-> See [Honest status](#honest-status) before evaluating this.
+> **Status: v1.0 — all seven phases complete.** Ingestion from three vendors,
+> reference data, the dbt transform layer, the point-in-time API, nightly Prefect
+> orchestration, a Streamlit dashboard, CI, and branch protection are done and
+> tested against live vendor data. **This is a feature-complete portfolio
+> project, not a maintained product** — see [Honest status](#honest-status) for
+> what is deliberately not built before evaluating it.
 
 That badge is not decorative. CI builds the schema **from empty**, loads a real
 warehouse snapshot, and runs the full dbt suite and the integration suite
@@ -37,17 +38,26 @@ runs and what deliberately does not.
 ## Architecture
 
 ```
-   Polygon.io ─┐
-    OpenFIGI ──┼──▶  Python ingestion  ──┬──▶  Parquet archive   (immutable, append-only)
-  (future:     │     + run ledger        │
-   Yahoo,      │                         └──▶  Postgres `raw`    (working copy, upserted)
-   FRED, AV) ──┘                                      │
-                                                      ▼
-                                              dbt: staging ──▶ intermediate ──▶ marts
-                                                      │
-                                                      ▼
-                                              FastAPI  /securities  /prices
+  Polygon.io ─┐                                                    (primary prices)
+  Yahoo chart ┤                                                    (fallback prices)
+  FRED ───────┼──▶  Python ingestion  ──┬──▶  Parquet archive   (immutable, written FIRST)
+  OpenFIGI ───┘     + run ledger        │            │
+                          ▲             └────────────┴──▶  Postgres `raw`  (upserted)
+                          │                                        │
+                    Prefect flow                                   ▼
+                  (nightly, 22:00 UTC)                dbt: staging ─▶ intermediate ─▶ marts
+                                                                   │
+                                                                   ▼
+                                              FastAPI  /securities /prices
+                                                       /corporate-actions /pipeline/runs
+                                                                   │  HTTP only, no DB creds
+                                                                   ▼
+                                                        Streamlit dashboard
 ```
+
+**[DESIGN.md](DESIGN.md) has the same picture as a rendered Mermaid diagram**,
+plus the dbt DAG, the alternatives distilled from all thirteen ADRs, and two
+fully worked examples of defects that would otherwise be silently wrong.
 
 Every batch is written to **Parquet first, Postgres second**. A crash between
 them leaves an archived file with no database row — recoverable and detectable —
@@ -252,6 +262,14 @@ a shape to build against.
 
 ## The dashboard
 
+![The Price series page: AAPL raw close and volume, May–August 2026, with a dividend annotated on the chart and the resolved security_id, current ticker, resolution date and bar count shown as header tiles.](docs/img/dashboard-price-series.png)
+
+*Price series, `raw`. The header tiles are the point-in-time contract made
+visible: `SECURITY ID 2` is what the ticker resolved to, `RESOLVED AS OF` is
+which date decided that, and the caption beneath separates it from
+`actions_observed_through` — two different "as of" concepts, shown separately
+because collapsing them is how a point-in-time claim turns out to be false.*
+
 ```bash
 docker compose up -d          # Postgres + API + dashboard
 # http://localhost:8501
@@ -352,6 +370,56 @@ not evidence of much:
   cannot satisfy it. Verified the same way: pointing `split_adjusted` at the raw
   columns fails 4 integration assertions and 1 unit assertion.
 
+### Proving CI catches something
+
+A green badge proves a workflow ran, not that it would notice anything. So one
+PR was opened to fail on purpose, and is [left closed rather than
+deleted](https://github.com/DomeNemeth/financial-market-platform/pull/2) so the
+red check stays on the record.
+
+![The pull request body for PR #2, titled "DO NOT MERGE — deliberately broken, proving CI is real", showing the one-character diff changing f.ex_date <= b.trading_date to <, and the reasoning for choosing a silent data defect over a syntax error.](docs/img/ci-deliberate-break.png)
+
+The break was one character — `f.ex_date <= b.trading_date` to `<` — which drops
+every corporate action from the factor product **on its own ex-date**, so each
+split and dividend takes effect one session late. Nothing raises. Every price
+still looks like a price. **Against an empty database that PR would have been
+green**; it is caught only because CI loads a real warehouse fixture containing
+KLAC's 10-for-1 split and JPM's holiday-straddling dividend.
+
+Result: red at `dbt build` in 1m15s, `PASS=118 WARN=1 ERROR=1 SKIP=23`, and the
+merge blocked (`mergeStateStatus=BLOCKED`) despite the author being the repo
+owner, because branch protection sets `enforce_admins: true`. The enforced rule
+is committed at
+[`.github/branch-protection.json`](.github/branch-protection.json).
+
+The defect was caught by `assert_split_factors_agree_between_models` — *not* by
+the reconciliation tests it was aimed at, which never ran because dbt failed
+first. That test exists only because
+[ADR-0006](docs/adr/0006-source-priority-and-conflict.md) refuses to share code
+between two models that compute the same split product for different reasons.
+Merging them would have made their agreement true by construction, and this
+defect would have surfaced later and more noisily.
+
+---
+
+## Interview talking points
+
+If you are reading this to evaluate the engineering rather than to run it, these
+five are where the substance is. Each is a decision with a rejected alternative,
+a measured consequence, and a test that fails when it is undone.
+
+| # | Decision | Why it is interesting | Where |
+|---|---|---|---|
+| 1 | **The two vendors do not report the same quantity** | Polygon is fetched unadjusted; Yahoo's chart endpoint has no such flag and cannot opt out. Measured on KLAC's 10-for-1: Yahoo's pre-split close is `241.164` where Polygon's is `2411.64`. A naive "Polygon where present, Yahoo otherwise" rule adjusts that bar twice and lands it at `24.1164` — wrong by 100×, still a plausible price, and **every pre-existing test would have passed**. So the merge de-adjusts before it chooses. Proven by mutation: reversing priority → 258 failures; inverting the de-adjustment → exactly 9 | [DESIGN §3](DESIGN.md#3-worked-example-the-two-vendors-do-not-report-the-same-quantity) · [ADR-0006](docs/adr/0006-source-priority-and-conflict.md) |
+| 2 | **The macro join uses publication date, never observation date** | FRED dates an observation to the start of the period it describes. January 2026 unemployment is dated `2026-01-01` and was published `2026-02-11`. Joining on the obvious column leaks up to **175 days** of hindsight (GDP's worst case) into any backtest, and it backtests *beautifully*. Three of ten series are excluded rather than given an assumed lag, because inventing a publication date is the same error class as fabricating a CUSIP | [DESIGN §4](DESIGN.md#4-worked-example-a-macro-join-that-leaks-the-future) · [ADR-0012](docs/adr/0012-macro-data-vintages.md) |
+| 3 | **Nothing is called `adjusted_close`, and `price_type` has no default** | Two named series — `split_adjusted_*` for charting, `total_return_adjusted_*` for returns — because collapsing them is the most common way adjusted-price data gets misused. The API refuses to guess: omitting `price_type` is a 422. The runner-up was defaulting to `raw`, which would at least fail loudly; rejected because a loud wrong answer is still an answer the API chose to give | [ADR-0003](docs/adr/0003-adjusted-price-methodology.md) · [ADR-0009](docs/adr/0009-api-design.md) |
+| 4 | **Ticker resolution is point-in-time, and exists exactly once** | `where ticker = :ticker` never raises while being wrong. Resolution is bounded by the security's valid-time window: zero matches is a 404, several is a **409**. The test asserts an *outcome* — a ticker held by two unrelated companies over disjoint windows must return different securities, and a date in the gap year between them must 404. Reverting to a bare ticker match fails 7 of its 13 assertions. The dashboard holds no DB credentials specifically so this cannot be reimplemented in the UI | [ADR-0009](docs/adr/0009-api-design.md) · [`src/api/resolution.py`](src/api/resolution.py) |
+| 5 | **Tests carry non-vacuity guards, and CI runs on real data** | A test that only ever passes proves little. `assert_deadjusted_yahoo_reconciles_to_polygon_raw` fails if no bar in the dataset needs a real correction — *the absence of evidence is itself a failure*. `assert_point_in_time_macro_differs_from_naive` reconstructs the wrong join and fails if the two agree. This is why CI loads a real warehouse snapshot: against an empty database the suite is green, fast, and meaningless | [ADR-0013](docs/adr/0013-continuous-integration-scope.md) · [DESIGN §5](DESIGN.md#5-the-through-line) |
+
+The honest counterweight to all five is [Honest status](#honest-status), which
+lists what is not built and what is known-limited. Both lists are maintained
+deliberately.
+
 ---
 
 ## Design decisions
@@ -364,18 +432,19 @@ Written up as ADRs, with the alternatives that were rejected and why:
 | [0002](docs/adr/0002-parquet-landing-zone.md) | Parquet as an immutable landing zone, written before Postgres |
 | [0003](docs/adr/0003-adjusted-price-methodology.md) | Two named adjusted series; store factors, not adjusted prices |
 | [0004](docs/adr/0004-bitemporal-security-master.md) | Bitemporal security master — valid time and system time kept separate |
+| [0005](docs/adr/0005-prefect-for-orchestration.md) | Prefect over Airflow; a dbt `WARN` never fails the flow, a `FAIL` always does |
+| [0006](docs/adr/0006-source-priority-and-conflict.md) | Polygon primary, Yahoo fallback; de-adjust before choosing; never average |
 | [0007](docs/adr/0007-identifier-strategy.md) | Surrogate key anchored on FIGI; licensed identifiers never fabricated |
 | [0008](docs/adr/0008-dbt-modeling-conventions.md) | Per-source staging models; cross-source merging only at intermediate |
 | [0009](docs/adr/0009-api-design.md) | Required `price_type` enum; `as_of` resolves valid time only; one error envelope |
 | [0010](docs/adr/0010-dependency-and-runtime-pinning.md) | Stable-only dependency ranges and a pinned interpreter |
 | [0011](docs/adr/0011-ingestion-failure-policy.md) | Collect-and-continue on partial failure, then fail the run |
+| [0012](docs/adr/0012-macro-data-vintages.md) | Macro joins on publication date, never observation date; no assumed lags |
 | [0013](docs/adr/0013-continuous-integration-scope.md) | What CI runs; real fixtures over synthetic; no vendor calls in CI |
 
-All twelve ADRs are written; none are stubs. [0005](docs/adr/0005-prefect-for-orchestration.md)
-covers Prefect and what a dbt failure means to a flow,
-[0006](docs/adr/0006-source-priority-and-conflict.md) source priority and
-cross-source conflict, and [0012](docs/adr/0012-macro-data-vintages.md) macro
-publication lag and the vintage limitation.
+**All thirteen ADRs are written; none are stubs**, and ADR-0003 carries an
+addendum on computing the factor products in SQL. [DESIGN.md](DESIGN.md) distils
+the strongest rejected alternative from each into one table.
 
 Two decisions that are load-bearing enough to summarise here:
 
@@ -453,7 +522,24 @@ adjusted series reconciled against the Python reference and against Polygon ·
 point-in-time API over `dim_security` and `fct_security_price_daily` ·
 a three-page Streamlit dashboard reading only over HTTP ·
 CI that builds the schema from empty and runs the whole suite against real data ·
+branch protection requiring that CI, proven against a deliberately broken PR ·
 123 dbt data tests · 150 Python tests.
+
+Last full local sweep, **2026-08-09**, against a live database and real vendor
+data rather than mocks:
+
+| Check | Result |
+|---|---|
+| `ruff check src/ tests/ scripts/ orchestration/` | clean |
+| `pytest -m "not integration"` | **57 passed** |
+| `pytest tests/integration -m "not live_vendor"` | **80 passed, 0 skipped** |
+| `pytest tests/integration -m live_vendor` | **13 passed** (real Polygon calls) |
+| `dbt build` | **PASS=142 WARN=1 ERROR=0 SKIP=0**, 143 nodes |
+| CI on `main` | green |
+
+`0 skipped` is the assertion, not `80 passed` — several integration tests
+`pytest.skip` themselves when their data is absent, so a warehouse that had lost
+a fixture would leave a green run that proved nothing.
 
 **Not built yet:**
 
@@ -500,6 +586,14 @@ CI that builds the schema from empty and runs the whole suite against real data 
   The full bitemporal replay needs an observation filter in the transform layer
   that does not exist yet — [ADR-0009](docs/adr/0009-api-design.md) explains why
   doing half of it would be worse than doing none.
+- **Macro vintages are not stored, and that deferral has now expired.**
+  [ADR-0012](docs/adr/0012-macro-data-vintages.md) deferred "store every vintage"
+  to Phase 6 on size grounds. Phase 6 shipped without it and the project closed
+  at v1.0, so the ADR's deferral target is stale — recorded here rather than
+  quietly left pointing at a phase that came and went. The consequence is
+  unchanged and bounded: the point-in-time join removes look-ahead about a
+  number's *existence*, not about its *value*, and `macro_vintage_date` is
+  carried per row so a consumer can see which revision they hold.
 - The total-return series has **no external oracle**. Polygon's adjusted
   aggregates are split-only, so the dividend leg is checked against the Python
   reference and against a definitional property (on the session before an
@@ -531,7 +625,11 @@ CI that builds the schema from empty and runs the whole suite against real data 
 4. ✅ API layer — point-in-time prices endpoint → `v0.5`
 5. ✅ Completeness — Yahoo fallback, FRED macro, Prefect orchestration → `v0.7`
 6. ✅ Polish — Streamlit dashboard, CI/CD → `v0.8`
-7. ⬜ Release — docs, clean-environment test → `v1.0`
+7. ✅ Release — DESIGN.md, branch protection, verification sweep → `v1.0`
+
+**All seven phases are complete.** The project is finished as scoped; the
+[Honest status](#honest-status) list above is what a Phase 8 would start from,
+and it is not planned.
 
 ---
 
