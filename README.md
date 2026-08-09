@@ -558,6 +558,17 @@ a fixture would leave a green run that proved nothing.
   `scripts/export_ci_fixtures.py` regenerates them from a live warehouse in one
   command, and refuses to run if that warehouse has lost any fact the test
   suites depend on. Until it is re-run, CI tests against 2026-08-05 data.
+- **The clean-environment test has not been run.** CI covers most of what it
+  exists for — schema from empty, on a fresh Ubuntu runner, on every commit —
+  but that is Linux with environment variables set natively, which is not the
+  same claim as "someone clones this on an unfamiliar machine and follows the
+  Quickstart to a working stack". Until it is done, the Quickstart above is
+  verified by inspection rather than by execution. Treat it accordingly.
+- **The `trading_calendar` seed expires on 2027-08-02.**
+  `exchange_calendars` only generates about a year forward, so the committed
+  seed is clamped there. Past that date `assert_no_missing_trading_days` starts
+  failing on sessions the calendar does not know about. This is the one thing
+  here that breaks with the passage of time rather than with a decision.
 - **The Prefect worker is a process someone must keep running.** A laptop
   deployment is not high availability, and ADR-0005 says so.
 - **No auth, no rate limiting, no pagination on the API.** `/prices` caps a
@@ -626,10 +637,13 @@ a fixture would leave a green run that proved nothing.
 5. ✅ Completeness — Yahoo fallback, FRED macro, Prefect orchestration → `v0.7`
 6. ✅ Polish — Streamlit dashboard, CI/CD → `v0.8`
 7. ✅ Release — DESIGN.md, branch protection, verification sweep → `v1.0`
+   - ⬜ **clean-environment test** — the one Phase 7 item not done
 
-**All seven phases are complete.** The project is finished as scoped; the
-[Honest status](#honest-status) list above is what a Phase 8 would start from,
-and it is not planned.
+**The project is finished as scoped**, with that single carve-out stated rather
+than folded away: Phase 7's original scope was "docs, ADRs, clean-environment
+test", and the test has not been run. The
+[Honest status](#honest-status) list is what a Phase 8 would start from, and it
+is not planned.
 
 ---
 
