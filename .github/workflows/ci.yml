@@ -28,7 +28,6 @@ jobs:
   # disables the protection rule, because a required check that never reports is
   # simply never waited for. Don't.
   ci:
-    name: build, migrate, dbt, test
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
