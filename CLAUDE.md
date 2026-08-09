@@ -102,7 +102,7 @@ All Phase 6 items are in:
 | `GET /corporate-actions/{ticker}` | ✅ done, 11 tests, mutation-verified |
 | Three-page Streamlit dashboard, thin HTTP client | ✅ done |
 | `dashboard` service in `docker-compose.yml` | ✅ done |
-| Branch protection + a deliberate-break PR | ⬜ **needs the repo owner** — see below |
+| Branch protection + a deliberate-break PR | ✅ done 2026-08-09 — see below |
 
 Verified on 2026-08-05, against real data and a live database, not against mocks:
 
@@ -122,12 +122,15 @@ Verified on 2026-08-05, against real data and a live database, not against mocks
 
 The one WARN is `assert_dividend_factors_have_a_reference_close` at **138 rows, down from 142**. Neither CI nor the flow fails on a `WARN`, and neither asserts the count — it moves legitimately whenever the ingestion window moves, so pinning it would convert honest reporting into a brittle test.
 
-### Still outstanding — needs the repo owner
+### Branch protection, and the PR that proved CI is real
 
-The repository is now public. Two Phase 6 items cannot be done from here because `gh` is not installed on this machine and branch protection is a GitHub-side setting:
+Both done 2026-08-09. `gh` 2.97.0 is now installed (release ZIP to `~/tools/gh`, no admin — winget is unusable here, see ADR-0010), so this is drivable from the CLI.
 
-1. **Turn on branch protection** for `main`: require a PR, require the status check named **`ci`**, require branches to be up to date. The job id in `ci.yml` is `ci`; **renaming that job silently disables the protection rule**, because a required check that never reports is simply never waited for.
-2. **Prove CI is real** by breaking something deliberately in a PR, watching it go red, then reverting. The sharpest break is not a syntax error — it is deleting the `DISTINCT ON` from `upsert_dataframe()`, or flipping `f.ex_date <= b.trading_date` to `<` in `int_prices_with_adjustments`. Both are silent in production and both should turn CI red.
+**`main` is protected.** Required check **`ci`**, `strict: true` (branches must be up to date), a PR required with 0 approvals, force pushes and deletions blocked, and **`enforce_admins: true`** — the owner has no bypass. The rule is committed as `.github/branch-protection.json`; GitHub holds the authoritative copy and nothing syncs the file, so it is documentation and a re-apply source, not state.
+
+**PR #2 was deliberately broken and is left closed rather than deleted**, so the red check stays as evidence. It flipped `f.ex_date <= b.trading_date` to `<` in `int_prices_with_adjustments` — the classic off-by-one, which drops every action from the factor product on its own ex-date. Result: red at `dbt build` in 1m15s, `PASS=118 WARN=1 ERROR=1 SKIP=23`, and `mergeStateStatus=BLOCKED`.
+
+The other candidate break (deleting `DISTINCT ON` from `upsert_dataframe()`) is still a valid one to re-run against a future CI change; it is caught by the integration suite rather than by dbt.
 
 ### What Phase 2 added
 
@@ -281,6 +284,9 @@ stg_yahoo__prices   ─┴→ int_prices_with_calendar   (+source in the grain)
 - **`0 skipped` is the assertion, not `80 passed`.** Several integration tests skip themselves when their data is absent, so a broken fixture load would leave a green CI. `load_ci_fixtures.py` re-verifies its invariants after loading — the KLAC split, the JPM holiday dividend, the nine Yahoo overlap bars, the DGS10 sentinel NULL, the 175-day GDP lag — so that failure is loud and happens upstream of the tests it would have disarmed.
 - **The corporate-actions point-in-time test was proven by mutation.** Re-keying the query from `security_id` to a ticker subquery fails exactly one of its 11 tests — the ticker-reuse one — and leaves the other ten green, which is correct: they concern a single never-reused security.
 - **The dashboard's thin-client rule is enforced by an absent environment**, not by review. `import src.common.database` fails inside the container.
+- **The deliberate break was caught by a test nobody aimed at it.** Flipping the corporate-actions inequality was expected to fail the three-way reconciliation, which is what it does locally (8 tests). In CI it never got that far: `assert_split_factors_agree_between_models` failed first, at `dbt build`, and the integration suite never ran. That test exists only because ADR-0006 refuses to share code between `int_splits__cumulative` and `int_prices_with_adjustments` — two models computing the same split product for different reasons, equal only if the vendors' split histories agree. Merging them would have made that agreement true by construction, and this defect would have reached the reconciliation tests instead of dying 40 seconds earlier.
+- **The same run separated the WARN from the ERROR under a real failure.** `PASS=118 WARN=1 ERROR=1`, exit 1 driven by the error alone, with the permanent `assert_dividend_factors_have_a_reference_close` warning still present and still not failing anything. ADR-0005's rule had only ever been exercised against a clean build before.
+- **`mergeable` and `mergeStateStatus` say different things, and only one of them is about protection.** PR #2 reported `mergeable=MERGEABLE` — no text conflicts — while `mergeStateStatus=BLOCKED`. Reading the first field alone would suggest a broken PR was ready to merge.
 
 ### Known issues
 - **The Prefect worker is a process someone has to keep running.** A laptop deployment is not high availability, and ADR-0005 says so rather than implying otherwise. A missed run is repaired by the next one — the flow uses a trailing 5-day window and loads are idempotent — but only if something restarts the worker.
@@ -342,7 +348,8 @@ Full rationale in `docs/adr/`. **All thirteen ADRs are written** — 0001–0013
 - **The dashboard never touches the database.** No `POSTGRES_*` in its compose environment and no SQLAlchemy import. A UI with its own query is a second implementation of ticker resolution, which is the bare-ticker join ADR-0009 exists to prevent, at the one layer a human looks at.
 - **The dashboard palette is copied from a validated set, not chosen.** Colourblind-safety is computed. If the surface changes, the palette must be re-validated against the new one — contrast results are only meaningful against the surface a chart actually renders on.
 - **Never a dual-axis chart.** Price and volume are two stacked panels sharing one x-axis. Twin y-scales invent a correlation that is not in the data, because the alignment between them is arbitrary.
-- **The CI job id is `ci`.** Branch protection requires a check by that name; renaming the job silently disables the rule, because a required check that never reports is never waited for.
+- **The CI job id is `ci` and the job has no `name:`.** GitHub names a check run after the job's `name:` when one is set, falling back to the job id only when absent — so adding a `name:` renames the check and the required check `ci` stops reporting. That does not disable the rule quietly; a required check with no status pins every PR at "Expected" and blocks the merge with nothing explaining why. The `name:` was there once and was removed for exactly this reason.
+- **Branch protection is recorded in `.github/branch-protection.json`.** It is applied, not generated — GitHub stores the real rule server-side and nothing syncs the file. It exists so a clone can see what is enforced, and so a change to the rule is reviewed rather than clicked. Re-apply with `gh api repos/:owner/:repo/branches/main/protection -X PUT --input .github/branch-protection.json`.
 
 ---
 
