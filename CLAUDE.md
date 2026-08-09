@@ -86,9 +86,15 @@ curl 'http://localhost:8000/corporate-actions/KLAC?start=2026-05-01&end=2026-08-
 
 ---
 
-## Where we are — Phase 6 of 7, complete
+## Where we are — all seven phases complete, released as `v1.0`
 
-**Phases 1–5 are complete (tagged `v0.2`, `v0.3`, `v0.5`, `v0.7`). Phase 6 is complete and tagged `v0.8`.** Phase 7 (release docs, clean-environment test, `v1.0`) is next.
+**Phases 1–7 are complete, tagged `v0.2`, `v0.3`, `v0.5`, `v0.7`, `v0.8`, `v1.0`.** Phase 7 shipped [DESIGN.md](DESIGN.md), the README release pass, branch protection, and a full verification sweep on 2026-08-09.
+
+**One Phase 7 item is outstanding and is not counted as done: the clean-environment test.** CI covers most of what it was for — schema from empty, on a fresh Ubuntu runner, every commit — but that is Linux with environment variables set natively, which is not the same claim as "a person clones this on an unfamiliar machine and follows the Quickstart to a working stack". The repo owner is running that separately. Until it is done, the Quickstart is verified by inspection, not by execution.
+
+**`v0.8` was created retroactively on 2026-08-09**, at the Phase 6 merge commit `3197b29`. This file and the README had both claimed the tag existed when it did not; making the claim true was the smaller correction. Noted here so the tag date is not mistaken for the work date.
+
+This file is working notes and stays deliberately more granular than the public docs. [README.md](README.md) is the tour and carries `Honest status`; [DESIGN.md](DESIGN.md) is the argument — architecture, rejected alternatives, and two worked examples. Prefer updating those when a fact is one a reader of the repository needs.
 
 All Phase 6 items are in:
 
@@ -383,6 +389,15 @@ Full rationale in `docs/adr/`. **All thirteen ADRs are written** — 0001–0013
 4. ✅ **API layer** — FastAPI + point-in-time prices endpoint → tagged `v0.5`
 5. ✅ **Completeness** — Yahoo fallback, FRED macro, Prefect orchestration → tagged `v0.7`
 6. ✅ **Polish** — Streamlit dashboard, CI/CD → tagged `v0.8`
-7. Release — docs, ADRs, clean-environment test → tag `v1.0` ← *next*
+7. ✅ **Release** — DESIGN.md, branch protection, verification sweep → tagged `v1.0`
+   · ⬜ clean-environment test still outstanding, with the repo owner
 
-Realistic timeline: 10–14 weeks part-time.
+**The project is finished as scoped.** What remains is the clean-environment
+test above, plus the deliberate non-goals in the README's `Honest status` — those
+are scope decisions, not unfinished work, and should not be quietly converted
+into a Phase 8.
+
+One thing does expire with time rather than with a decision: **the
+`trading_calendar` seed is clamped to 2027-08-02**, because `exchange_calendars`
+only generates about a year forward. It must be regenerated before then or
+`assert_no_missing_trading_days` starts failing on dates past the clamp.
